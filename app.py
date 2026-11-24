@@ -18,7 +18,7 @@ from core import format_table, load_data
 ROOT = Path(__file__).resolve().parent
 OUTPUTS = ROOT / 'notebook' / 'outputs'
 
-# Links shown in the app (set once the repository and the deployment exist)
+# Links shown in the app
 REPO_URL = 'https://github.com/UgoBoudjelal/Browne-s-Permanent-Portfolio-'
 NOTEBOOK_PATH = 'notebook/Group_G_Permanent_Portfolio.ipynb'
 
@@ -28,12 +28,22 @@ RULES = ['Tolerance band', 'Calendar reset', 'Buy and hold']
 DEFAULTS = {'rule': 'Tolerance band', 'band_low': 15, 'band_high': 35, 'review': 'Monthly', 'cost': 0.05,
             'cost_stress': 0.50, 'bench_equity': 60, 'amount': 10_000}
 
-# Colour-blind-safe series colours (validated for both themes), chart ink and the diverging pair
+# Browne's four economic seasons and the sleeve meant for each (Browne, 1999)
+SLEEVES = ['Equities (VTI)', 'Long-term Treasuries (TLT)', 'Gold (GLD)', 'Treasury bills']
+SLEEVE_COLS = ['VTI', 'TLT', 'GLD', 'rf']
+SEASONS = {'Equities (VTI)': 'Prosperity', 'Long-term Treasuries (TLT)': 'Deflation',
+           'Gold (GLD)': 'Inflation', 'Treasury bills': 'Recession'}
+
+# "Four regimes" palette, validated for colour-blind safety in both themes. Portfolios: the Permanent
+# Portfolio in magenta, the stock-bond benchmark in blue, VTI in the equity sleeve's green. Sleeves: one colour
+# per economic season, used on every chart of the sleeves.
 PALETTE = {
-    'light': {'series': ['#2a78d6', '#eb6834', '#1baf7a', '#eda100'], 'muted': '#898781', 'ink': '#0b0b0b',
-              'soft': '#b5b3ab', 'band': '#2a78d6', 'neg': '#e66767', 'mid': '#f0efec', 'pos': '#5598e7'},
-    'dark': {'series': ['#3987e5', '#d95926', '#199e70', '#c98500'], 'muted': '#898781', 'ink': '#f0efec',
-             'soft': '#5f5e59', 'band': '#3987e5', 'neg': '#e34948', 'mid': '#383835', 'pos': '#2a78d6'},
+    'light': {'series': ['#b03f86', '#2f7fd0', '#3a9a4b'], 'sleeves': ['#3a9a4b', '#3b6fd4', '#b07d0a', '#8a63d2'],
+              'muted': '#7a837d', 'ink': '#17201b', 'soft': '#b9c0bb', 'band': '#b03f86',
+              'neg': '#e66767', 'mid': '#eef0ed', 'pos': '#5598e7'},
+    'dark': {'series': ['#c75298', '#4a8ee0', '#3f9f50'], 'sleeves': ['#3f9f50', '#4a8ee0', '#b98008', '#8e6fe0'],
+             'muted': '#8c958f', 'ink': '#eaeeea', 'soft': '#4d5550', 'band': '#c75298',
+             'neg': '#e34948', 'mid': '#2b3133', 'pos': '#2a78d6'},
 }
 
 st.set_page_config(page_title='Permanent Portfolio explorer', page_icon=':material/balance:', layout='wide')
@@ -96,7 +106,7 @@ def table_text(df):
     return df.map(lambda v: '–' if v == '-' else v)
 
 
-def time_chart(wide, fmt, y_title, key, colors, log=False, under=(), height=340, y_domain=None):
+def time_chart(wide, fmt, y_title, key, colors, log=False, under=(), over=(), height=340, y_domain=None):
     """Lines over time with a hover crosshair; the tooltip lists every series at the hovered month."""
     names = list(wide.columns)
     data = wide.rename_axis('Date').reset_index()
@@ -125,7 +135,7 @@ def time_chart(wide, fmt, y_title, key, colors, log=False, under=(), height=340,
     cursor = alt.Chart(safe).mark_rule(color=P['muted'], strokeWidth=1).encode(x='Date:T') \
         .transform_filter(hover)
     dots = lines.mark_point(filled=True, size=60, opacity=1).transform_filter(hover)
-    return alt.layer(*under, lines, cursor, dots, targets).properties(height=height)
+    return alt.layer(*under, lines, *over, cursor, dots, targets).properties(height=height)
 
 
 def vertical_marks(dates):
@@ -133,6 +143,20 @@ def vertical_marks(dates):
     df = pd.DataFrame({'Date': pd.to_datetime(list(dates))})
     return alt.Chart(df).mark_rule(color=P['muted'], strokeDash=[3, 3], strokeWidth=1, opacity=0.8) \
         .encode(x='Date:T')
+
+
+def crisis_shading(crisis_table):
+    # Shaded equity peak-to-trough windows with their names, staggered on three lines
+    if crisis_table.empty:
+        return [], []
+    df = pd.DataFrame({'start': [pd.Timestamp(v) for v in crisis_table['Equity peak']],
+                       'end': [pd.Timestamp(v) for v in crisis_table['Equity trough']],
+                       'label': [n.split(' (')[0] for n in crisis_table.index]})
+    df['row'] = [i % 3 for i in range(len(df))]
+    rects = alt.Chart(df).mark_rect(color=P['ink'], opacity=0.07).encode(x='start:T', x2='end:T')
+    labels = [alt.Chart(df[df['row'] == r]).mark_text(align='left', dx=3, fontSize=10, color=P['muted'])
+              .encode(x='start:T', y=alt.value(8 + 12 * r), text='label:N') for r in range(3)]
+    return [rects], labels
 
 
 def show_data(df, label='Show data', file_name=None):
@@ -155,9 +179,9 @@ def reset_assumptions():
 # ----------------------------------------------------------------------------------------------------------
 
 st.title('Permanent Portfolio explorer')
-st.caption("Harry Browne's Permanent Portfolio: 25% each in US equities (VTI), long-term Treasuries (TLT), gold "
-           "(GLD) and Treasury bills, backtested on monthly data and compared with a stock–bond benchmark. "
-           "Group G · 2270 Financial Modeling · Nova SBE.")
+st.caption("Four assets for four economic seasons: Harry Browne's Permanent Portfolio holds 25% each in US "
+           "equities, long-term Treasuries, gold and Treasury bills. Backtested on monthly data and compared with a "
+           "stock–bond benchmark. Group G · 2270 Financial Modeling · Nova SBE.")
 
 rets, source = get_returns()
 MONTHS = list(rets.index.strftime('%Y-%m'))
@@ -235,7 +259,7 @@ with st.sidebar:
               width='stretch', disabled=is_default and amount == DEFAULTS['amount'], key='reset')
 
 # ----------------------------------------------------------------------------------------------------------
-# Status line
+# Status line and view
 # ----------------------------------------------------------------------------------------------------------
 
 with st.container(horizontal=True, vertical_alignment='center'):
@@ -244,11 +268,16 @@ with st.container(horizontal=True, vertical_alignment='center'):
     else:
         st.badge("Data saved by the notebook's run", icon=':material/save:', color='orange')
     if is_default:
-        st.badge("Notebook's assumptions", icon=':material/verified:', color='blue')
+        st.badge("Notebook's assumptions", icon=':material/verified:', color='primary')
     else:
         st.badge('Custom assumptions', icon=':material/tune:', color='violet')
     st.caption(f'Rule: {rule_text} · cost {cost:.2%} per side · benchmark {bench} VTI/AGG · '
                f'{month_label(first)} to {month_label(last)}')
+    st.space('stretch')
+    view = st.segmented_control('View', ['Client', 'Analyst'], default='Client', required=True, key='view',
+                                bind='query-params', label_visibility='collapsed',
+                                help='Client: the key results in plain language. Analyst: every table and '
+                                     'analysis of the notebook.')
 
 if st.session_state.get('data_error') and source == 'saved':
     with st.container(border=True):
@@ -282,6 +311,13 @@ record = an.rebalancing_record(results, weights_before, cost, cost_stress)
 crisis_table, recovery_table = an.crisis_analysis(results, bench)
 rebalance_dates = list(results.index[results['turnover'] > 0])
 
+colors3 = P['series']
+names3 = [PP, bench, VTI]
+growth = pd.DataFrame({PP: an.wealth_index(results['pp_net']), bench: an.wealth_index(results['bench_6040']),
+                       VTI: an.wealth_index(results['stocks'])})          # value of $1, from 1 the month before
+wealth = growth * amount
+start_label = f'{(rets_p.index[0] - pd.DateOffset(months=1)):%B %Y}'
+
 # KPI row: the Permanent Portfolio net of costs, with the difference from the frictionless benchmark
 pp_m, b_m = perf_table[PP], perf_table[bench]
 final_pp, final_b = amount * pp_m['Growth of $1'], amount * b_m['Growth of $1']
@@ -302,31 +338,78 @@ with st.container(horizontal=True):
               signed_pp(pp_m['Maximum drawdown'] - b_m['Maximum drawdown']), delta_color='inverse',
               delta_description=f'vs {bench}', border=True)
 
-colors3 = P['series'][:3]
-names3 = [PP, bench, VTI]
-tabs = st.tabs(['Performance', 'Risk', 'Rebalancing and costs', 'Crises', 'Rebalancing rules', 'Calendar years',
-                'Method and data'], key='tab', bind='query-params')
 
 # ----------------------------------------------------------------------------------------------------------
-# 1. Performance (Sections 10 and 11)
+# Sections (each tab is one function, shared by the client and analyst views)
 # ----------------------------------------------------------------------------------------------------------
-with tabs[0]:
+
+def section_overview():
+    # The key results in plain sentences, written from the computed numbers
+    v_m = perf_table[VTI]
+    lines = [
+        f"From the end of {start_label} to the end of {pd.Timestamp(last + '-01'):%B %Y}, ${amount:,.0f} in the "
+        f"Permanent Portfolio grew to "
+        f"**${final_pp:,.0f}**, a compound return of {pct(pp_m['Compound annual return'])} a year, against "
+        f"${final_b:,.0f} ({pct(b_m['Compound annual return'])}) for the {bench} and "
+        f"${amount * v_m['Growth of $1']:,.0f} ({pct(v_m['Compound annual return'])}) for an all-equity portfolio.",
+        f"Its largest fall from a previous peak was **{pct(pp_m['Maximum drawdown'], 1)}**, against "
+        f"{pct(b_m['Maximum drawdown'], 1)} for the {bench} and {pct(v_m['Maximum drawdown'], 1)} for equities, "
+        f"with an annualized volatility of {pct(pp_m['Annualized volatility'], 1)} against "
+        f"{pct(b_m['Annualized volatility'], 1)}.",
+    ]
+    if not crisis_table.empty:
+        better = int((crisis_table[PP] > crisis_table[bench]).sum())
+        n_crises = len(crisis_table)
+        worst = crisis_table[PP].idxmin()
+        episode = {'Financial crisis (2007-09)': 'the financial crisis of 2007–09',
+                   'Debt crises (2011)': 'the debt crises of 2011', 'Q4 2018 sell-off': 'the sell-off of late 2018',
+                   'COVID-19 crash (2020)': 'the COVID-19 crash of 2020',
+                   'Rate shock (2022)': 'the rate shock of 2022'}.get(worst, worst)
+        how_many = f'all {n_crises}' if better == n_crises else f'{better} of the {n_crises}'
+        worst_return = crisis_table.loc[worst, PP]
+        tail = (f"its largest peak-to-trough loss in a crisis was {pct(-worst_return, 1)}, during {episode}"
+                if worst_return < 0 else 'it held or gained value from the equity peak to the trough in every one')
+        lines.append(f"It did better than the {bench} in **{how_many}** equity crises of the period; {tail}.")
+    lines.append(f"Per unit of risk it earned a Sharpe ratio of **{pp_m['Sharpe ratio']:.2f}**, against "
+                 f"{b_m['Sharpe ratio']:.2f} for the {bench}.")
+    with st.container(border=True):
+        st.markdown('#### In brief')
+        st.markdown('\n'.join(f'- {s}' for s in lines))
+        st.caption(f'Permanent Portfolio net of {cost:.2%} costs per side; {bench} before costs. The sentences '
+                   'update with the assumptions in the sidebar.')
+
+    st.subheader(f'Value of ${amount:,.0f} invested at the end of {start_label}')
     with st.container(horizontal=True, vertical_alignment='center'):
-        st.subheader(f'Value of ${amount:,.0f} invested at the end of '
-                     f'{(rets_p.index[0] - pd.DateOffset(months=1)):%B %Y}')
+        st.space('stretch')
         log_scale = st.toggle('Log scale', key='log_scale')
         show_marks = st.toggle('Rebalancing dates', key='show_marks', value=True)
-    wealth = pd.DataFrame({PP: an.wealth_index(results['pp_net']),
-                           bench: an.wealth_index(results['bench_6040']),
-                           VTI: an.wealth_index(results['stocks'])}) * amount
-    under = [vertical_marks(rebalance_dates)] if show_marks and 0 < len(rebalance_dates) <= 60 else []
+    shade, labels = crisis_shading(crisis_table)
+    under = shade + ([vertical_marks(rebalance_dates)] if show_marks and 0 < len(rebalance_dates) <= 60 else [])
     st.altair_chart(time_chart(wealth, '$,.0f', 'Portfolio value (USD)', 'wealth', colors3, log=log_scale,
-                               under=under, height=380),
-                    alt=f'Growth of ${amount:,.0f} in the Permanent Portfolio, the {bench} benchmark and VTI')
-    st.caption(f'Permanent Portfolio net of {cost:.2%} costs per side; {bench} benchmark before costs; dashed '
-               'lines mark the months in which the portfolio was rebalanced.')
+                               under=under, over=labels, height=400),
+                    alt=f'Growth of ${amount:,.0f} in the Permanent Portfolio, the {bench} benchmark and VTI, with '
+                        'the equity crises shaded')
+    st.caption('Shaded: equity crises, from the equity peak to the trough. Dashed lines: months in which the '
+               'portfolio was rebalanced back to 25% each.')
     show_data(wealth.round(2), file_name='portfolio_values.csv')
 
+    left, right = st.columns([3, 2], gap='large')
+    with left:
+        st.markdown('**At a glance**')
+        glance = ['Compound annual return', 'Annualized volatility', 'Sharpe ratio', 'Maximum drawdown',
+                  'Growth of $1']
+        st.table(table_text(format_table(perf_table.loc[glance, names3])), alt='Key measures of the three portfolios')
+    with right:
+        st.markdown('**What the measures mean**')
+        st.markdown(
+            '- *Compound return*: the constant annual rate that turns the initial amount into the final value.\n'
+            '- *Volatility*: how much monthly returns swing, annualized.\n'
+            '- *Sharpe ratio*: return above Treasury bills per unit of volatility.\n'
+            '- *Maximum drawdown*: the largest fall from a previous peak in value.\n'
+            '- *Growth of $1*: what each dollar invested at the start became.')
+
+
+def section_performance():
     st.subheader('Performance measures')
     st.caption(f'{month_label(first)} to {month_label(last)}. Permanent Portfolio net of {cost:.2%} (base) and '
                f'{cost_stress:.2%} (stress) costs per side; the benchmark without and with base costs. Beta, alpha, '
@@ -338,13 +421,13 @@ with tabs[0]:
             st.markdown('**Relative to the all-equity portfolio (VTI)**')
             st.table(table_text(format_table(perf_vs_stocks)), alt='Permanent Portfolio measured against VTI')
         with st.container(border=True):
-            st.markdown('**What the measures mean**')
+            st.markdown('**Definitions**')
             st.markdown(
                 '- *Average return* is the mean monthly return × 12; *compound return* is the constant annual '
                 'rate that turns the initial amount into the final value.\n'
                 '- *Volatility* is the standard deviation of monthly returns × √12.\n'
                 '- *Sharpe ratio*: mean monthly return in excess of T-bills divided by its standard deviation, '
-                '× √12, i.e. excess return per unit of risk.\n'
+                '× √12.\n'
                 '- *Beta*: sensitivity of the excess return to that of the benchmark. *Alpha*: the annualized '
                 'excess return that beta does not explain; a *t-statistic* above about 2 in absolute value '
                 'indicates significance at 5%.\n'
@@ -353,10 +436,8 @@ with tabs[0]:
                 '- *Maximum drawdown*: the largest fall from a previous peak in value.')
     show_data(perf_table, 'Unformatted values', file_name='performance_measures.csv')
 
-# ----------------------------------------------------------------------------------------------------------
-# 2. Risk (Section 12)
-# ----------------------------------------------------------------------------------------------------------
-with tabs[1]:
+
+def section_risk():
     drawdowns = -(wealth.cummax() - wealth) / wealth.cummax()
     st.subheader('Drawdown from the previous peak')
     st.altair_chart(time_chart(drawdowns, '.0%', 'Drawdown', 'dd', colors3, height=300,
@@ -380,7 +461,6 @@ with tabs[1]:
         rr = pd.DataFrame({'Portfolio or asset': list(assets),
                            'Annualized volatility': [assets[a].std() * np.sqrt(an.PERIODS) for a in assets],
                            'Annualized average return': [assets[a].mean() * an.PERIODS for a in assets]})
-        rr['Group'] = ['Portfolio'] * 3 + ['Constituent or bond index'] * 4
         rr['Colour'] = colors3 + [P['soft']] * 4
         # Labels to the left of points that have a close neighbour on their right
         rr['Side'] = ['left', 'right', 'left', 'left', 'right', 'below', 'right']
@@ -400,13 +480,10 @@ with tabs[1]:
         st.altair_chart(alt.layer(points, label_right, label_left, label_below).properties(height=300),
                         alt='Annualized mean return against volatility for the portfolios and their constituents')
         st.caption('The three portfolios in colour; the constituents and the bond index in grey.')
-    show_data(rr.drop(columns=['Colour', 'Group', 'Side']).set_index('Portfolio or asset'),
-              'Show risk and return data')
+    show_data(rr.drop(columns=['Colour', 'Side']).set_index('Portfolio or asset'), 'Show risk and return data')
 
-# ----------------------------------------------------------------------------------------------------------
-# 3. Rebalancing and costs (Sections 7, 8 and 13)
-# ----------------------------------------------------------------------------------------------------------
-with tabs[2]:
+
+def section_rebalancing():
     kpi = st.columns(5)
     kpi[0].metric('Rebalancing events', f"{int(cost_summary['Rebalancing events'])}",
                   help=f"Over {cost_summary['Years in sample']:.1f} years", border=True)
@@ -423,18 +500,18 @@ with tabs[2]:
 
     st.subheader('Pre-trade weights and the tolerance band')
     w_show = weights_before.copy()
-    w_show.columns = ['Equities (VTI)', 'Long-term Treasuries (TLT)', 'Gold (GLD)', 'Treasury bills']
+    w_show.columns = SLEEVES
     band_layer = []
     if rule == 'Tolerance band':
         band_layer.append(alt.Chart(pd.DataFrame({'low': [low], 'high': [high]})).mark_rect(
-            color=P['band'], opacity=0.10).encode(y='low:Q', y2='high:Q'))
+            color=P['band'], opacity=0.08).encode(y='low:Q', y2='high:Q'))
     if 0 < len(rebalance_dates) <= 60:
         band_layer.append(vertical_marks(rebalance_dates))
-    st.altair_chart(time_chart(w_show, '.0%', 'Weight before rebalancing', 'weights', P['series'],
+    st.altair_chart(time_chart(w_show, '.0%', 'Weight before rebalancing', 'weights', P['sleeves'],
                                under=band_layer, height=340),
                     alt='Weights of the four sleeves after drift, with the tolerance band and rebalancing dates')
-    st.caption('Weights at each month-end after drift and before any trade. The shaded area is the tolerance '
-               'band; dashed lines mark rebalancing to 25% each.')
+    st.caption('Weights at each month-end after drift and before any trade, in the colour of each sleeve\'s '
+               'economic season. The shaded area is the tolerance band; dashed lines mark rebalancing to 25% each.')
 
     st.subheader('Rebalancing record')
     if record.empty:
@@ -456,51 +533,142 @@ with tabs[2]:
                f'{bench}. Because costs enter returns linearly, alpha falls in a straight line as the cost rate '
                'rises; the break-even cost is the rate at which it reaches zero.')
 
-# ----------------------------------------------------------------------------------------------------------
-# 4. Crises (Section 14)
-# ----------------------------------------------------------------------------------------------------------
-with tabs[3]:
-    st.subheader('Return from the equity peak to the equity trough')
+
+def section_crises():
+    st.subheader('How each crisis unfolded')
     if crisis_table.empty:
         st.info('None of the five crisis windows lies entirely inside the chosen period.', icon=':material/info:')
-    else:
-        bars = crisis_table[names3].reset_index().melt('Episode', var_name='Portfolio', value_name='Return')
-        order = list(crisis_table.index)
-        base = alt.Chart(bars).encode(
-            x=alt.X('Episode:N', sort=order, title=None, axis=alt.Axis(labelAngle=0, labelLimit=220)),
-            xOffset=alt.XOffset('Portfolio:N', sort=names3),
-            y=alt.Y('Return:Q', axis=alt.Axis(format='.0%'), title='Return, peak to trough'))
-        columns = base.mark_bar(cornerRadiusEnd=4, width={'band': 0.9}).encode(
-            color=alt.Color('Portfolio:N', scale=alt.Scale(domain=names3, range=colors3),
-                            legend=alt.Legend(title=None, orient='top')),
-            tooltip=['Episode', 'Portfolio', alt.Tooltip('Return:Q', format='.1%')])
-        up = base.mark_text(dy=-7, fontSize=11, color=P['ink']).encode(text=alt.Text('Return:Q', format='.1%')) \
-            .transform_filter('datum.Return >= 0')
-        down = base.mark_text(dy=9, fontSize=11, color=P['ink']).encode(text=alt.Text('Return:Q', format='.1%')) \
-            .transform_filter('datum.Return < 0')
-        zero = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color=P['muted']).encode(y='y:Q')
-        st.altair_chart(alt.layer(columns, zero, up, down).properties(height=360),
-                        alt='Peak-to-trough returns of the three portfolios in five equity crises')
-        st.caption('Each episode is dated by the lowest month-end of VTI within a search window and the highest '
-                   'month-end before it, as in Section 14 of the notebook.')
+        return
+    dates = list(growth.index)
+    frames = []
+    for ep, row in crisis_table.iterrows():
+        peak = pd.Timestamp(row['Equity peak'])
+        stop = dates[min(dates.index(pd.Timestamp(row['Equity trough'])) + 24, len(dates) - 1)]
+        seg = growth.loc[peak:stop]
+        for p in names3:
+            frames.append(pd.DataFrame({'Episode': ep, 'Portfolio': p, 'Months since the equity peak':
+                                        range(len(seg)), 'Value': 100 * seg[p].values / seg[p].iloc[0]}))
+    paths = pd.concat(frames)
+    order = list(crisis_table.index)
+    small = alt.Chart(paths).mark_line(strokeWidth=2).encode(
+        x=alt.X('Months since the equity peak:Q'),
+        y=alt.Y('Value:Q', title='Value (equity peak = 100)', scale=alt.Scale(zero=False)),
+        color=alt.Color('Portfolio:N', scale=alt.Scale(domain=names3, range=colors3),
+                        legend=alt.Legend(title=None, orient='top')),
+        tooltip=['Episode', 'Portfolio', 'Months since the equity peak', alt.Tooltip('Value:Q', format='.1f')],
+    ).properties(width=250, height=180).facet(
+        facet=alt.Facet('Episode:N', sort=order, title=None, header=alt.Header(labelFontSize=12)), columns=3)
+    st.altair_chart(small, alt='Value of each portfolio from the equity peak, in each of the five crises')
+    st.caption('Each panel starts at the equity peak (value 100) and runs to two years after the equity trough. '
+               'The crises are dated as in Section 14 of the notebook: the lowest month-end of VTI within a search '
+               'window and the highest month-end before it.')
 
-        left, right = st.columns([3, 2], gap='large')
-        with left:
-            st.markdown('**Peak-to-trough returns**')
-            shown = crisis_table.copy()
-            for p in names3:
-                shown[p] = [pct(v, 1) for v in crisis_table[p]]
-            st.table(shown, alt='Peak-to-trough returns by episode')
-        with right:
-            st.markdown('**Months from the equity peak to recovery**')
-            st.table(recovery_table.map(lambda v: 'not recovered' if pd.isna(v) else f'{int(v)}'),
-                     alt='Months from the equity peak until each portfolio regained its value')
-            st.caption('0 means the portfolio stood at or above its peak value at the trough.')
+    st.subheader('Return from the equity peak to the equity trough')
+    bars = crisis_table[names3].reset_index().melt('Episode', var_name='Portfolio', value_name='Return')
+    base = alt.Chart(bars).encode(
+        x=alt.X('Episode:N', sort=order, title=None, axis=alt.Axis(labelAngle=0, labelLimit=220)),
+        xOffset=alt.XOffset('Portfolio:N', sort=names3),
+        y=alt.Y('Return:Q', axis=alt.Axis(format='.0%'), title='Return, peak to trough'))
+    columns = base.mark_bar(cornerRadiusEnd=4, width={'band': 0.9}).encode(
+        color=alt.Color('Portfolio:N', scale=alt.Scale(domain=names3, range=colors3),
+                        legend=alt.Legend(title=None, orient='top')),
+        tooltip=['Episode', 'Portfolio', alt.Tooltip('Return:Q', format='.1%')])
+    up = base.mark_text(dy=-7, fontSize=11, color=P['ink']).encode(text=alt.Text('Return:Q', format='.1%')) \
+        .transform_filter('datum.Return >= 0')
+    down = base.mark_text(dy=9, fontSize=11, color=P['ink']).encode(text=alt.Text('Return:Q', format='.1%')) \
+        .transform_filter('datum.Return < 0')
+    zero = alt.Chart(pd.DataFrame({'y': [0]})).mark_rule(color=P['muted']).encode(y='y:Q')
+    st.altair_chart(alt.layer(columns, zero, up, down).properties(height=340),
+                    alt='Peak-to-trough returns of the three portfolios in five equity crises')
 
-# ----------------------------------------------------------------------------------------------------------
-# 5. Rebalancing rules (Section 15)
-# ----------------------------------------------------------------------------------------------------------
-with tabs[4]:
+    left, right = st.columns([3, 2], gap='large')
+    with left:
+        st.markdown('**Peak-to-trough returns**')
+        shown = crisis_table.copy()
+        for p in names3:
+            shown[p] = [pct(v, 1) for v in crisis_table[p]]
+        st.table(shown, alt='Peak-to-trough returns by episode')
+    with right:
+        st.markdown('**Months from the equity peak to recovery**')
+        st.table(recovery_table.map(lambda v: 'not recovered' if pd.isna(v) else f'{int(v)}'),
+                 alt='Months from the equity peak until each portfolio regained its value')
+        st.caption('0 means the portfolio stood at or above its peak value at the trough.')
+
+
+def section_regimes():
+    left, right = st.columns([2, 3], gap='large')
+    with left:
+        st.subheader('Four assets for four seasons')
+        cells = pd.DataFrame({'Season': ['Prosperity', 'Inflation', 'Deflation', 'Recession'],
+                              'Sleeve': ['Equities (VTI)', 'Gold (GLD)', 'Long-term Treasuries (TLT)',
+                                         'Treasury bills'],
+                              'x': [0, 1, 0, 1], 'y': [1, 1, 0, 0]})
+        cells['Colour'] = [P['sleeves'][SLEEVES.index(s)] for s in cells['Sleeve']]
+        # Positions inside each tile (tiles span 0.96 units; the gap between them is 0.04)
+        cells['x2'], cells['y2'] = cells['x'] + 0.96, cells['y'] + 0.96
+        cells['mx'], cells['my'] = cells['x'] + 0.14, cells['y'] + 0.76      # colour marker
+        cells['tx'] = cells['x'] + 0.08                                        # left edge of the text
+        cells['sy'], cells['ly'] = cells['y'] + 0.50, cells['y'] + 0.28       # season, sleeve
+        sx = alt.Scale(domain=[0, 1.96])
+
+        def pos(xcol, ycol):
+            return dict(x=alt.X(f'{xcol}:Q', axis=None, scale=sx), y=alt.Y(f'{ycol}:Q', axis=None, scale=sx))
+
+        tiles = alt.Chart(cells).mark_rect(cornerRadius=12, opacity=0.22).encode(
+            **pos('x', 'y'), x2='x2:Q', y2='y2:Q', color=alt.Color('Colour:N', scale=None))
+        marker = alt.Chart(cells).mark_square(size=180, opacity=1).encode(
+            **pos('mx', 'my'), color=alt.Color('Colour:N', scale=None))
+        season = alt.Chart(cells).mark_text(align='left', fontSize=17, fontWeight='bold', color=P['ink']).encode(
+            **pos('tx', 'sy'), text='Season:N')
+        sleeve = alt.Chart(cells).mark_text(align='left', fontSize=11, color=P['muted']).encode(
+            **pos('tx', 'ly'), text='Sleeve:N')
+        st.altair_chart(alt.layer(tiles, marker, season, sleeve).properties(height=330),
+                        alt="Browne's four economic seasons and the sleeve meant for each")
+        st.caption('Browne (1999) argues that each asset does well in a different economic season, so holding all '
+                   'four in equal parts means the portfolio does not depend on predicting which season comes next.')
+    with right:
+        st.subheader('Which sleeve led each year')
+        cal = an.calendar_returns(rets_p[SLEEVE_COLS])
+        counts = rets_p.groupby(rets_p.index.year).size()
+        cal.columns = SLEEVES
+        best = cal.idxmax(axis=1)
+        lead = pd.DataFrame({'Year': [f'{y}*' if counts[y] < 12 else str(y) for y in cal.index],
+                             'Sleeve': best.values, 'Return': cal.max(axis=1).values, 'Height': 1.0})
+        # Full-height bars, one per year, in the colour of the year's best sleeve
+        strip = alt.Chart(lead).mark_bar(cornerRadius=4, width={'band': 0.86}).encode(
+            x=alt.X('Year:O', sort=list(lead['Year']), title=None,
+                    axis=alt.Axis(labelAngle=0, ticks=False, labelExpr="'’' + substring(datum.label, 2)")),
+            y=alt.Y('Height:Q', axis=None, scale=alt.Scale(domain=[0, 1])),
+            color=alt.Color('Sleeve:N', scale=alt.Scale(domain=SLEEVES, range=P['sleeves']), legend=None),
+            tooltip=['Year', 'Sleeve', alt.Tooltip('Return:Q', format='.1%')]).properties(height=70)
+        st.altair_chart(strip, alt='The best-performing sleeve in each calendar year, coloured as in the '
+                                   'four-seasons graphic')
+        wins = best.value_counts()
+        short = {'Equities (VTI)': 'equities', 'Long-term Treasuries (TLT)': 'long-term Treasuries',
+                 'Gold (GLD)': 'gold', 'Treasury bills': 'Treasury bills'}
+        st.caption('Each bar is a calendar year, coloured by the sleeve with the best return that year (colours as '
+                   'in the four seasons). '
+                   'Best calendar-year return among the four sleeves: '
+                   + '; '.join(f'{short[s]} {int(wins.get(s, 0))} {"year" if wins.get(s, 0) == 1 else "years"}'
+                               for s in SLEEVES)
+                   + '. * Partial year.')
+
+        st.subheader('Calendar-year returns of each sleeve')
+        grid = st.columns(2)
+        for i, s in enumerate(SLEEVES):
+            df = pd.DataFrame({'Year': lead['Year'], 'Return': cal[s].values})
+            chart = alt.Chart(df).mark_bar(cornerRadiusEnd=3, color=P['sleeves'][i]).encode(
+                x=alt.X('Year:O', sort=list(df['Year']), title=None, axis=alt.Axis(labels=False, ticks=False)),
+                y=alt.Y('Return:Q', axis=alt.Axis(format='.0%'), title=None),
+                tooltip=['Year', alt.Tooltip('Return:Q', format='.1%')]).properties(
+                height=130, title=alt.TitleParams(f'{SEASONS[s]} · {s}', fontSize=12, anchor='start'))
+            with grid[i % 2]:
+                st.altair_chart(chart, alt=f'Calendar-year returns of {s}')
+        show_data(cal.set_axis(lead['Year']), 'Show calendar-year returns of the sleeves',
+                  file_name='sleeve_calendar_returns.csv')
+
+
+def section_rules():
     st.subheader('The strategy under alternative rebalancing rules')
     st.caption(f'Each rule is simulated with the same engine over the chosen period, net of {cost:.2%} costs per '
                f'side; alpha and the information ratio are relative to the {bench}. The strategy uses Browne\'s '
@@ -531,7 +699,7 @@ with tabs[4]:
     plot_df['Highlight'] = ['Strategy' if '(strategy)' in r else 'Current settings' if r == current else 'Other'
                             for r in plot_df['Rule']]
     hl_domain = ['Strategy', 'Current settings', 'Other']
-    hl_range = [P['series'][0], P['series'][1], P['soft']]
+    hl_range = [P['series'][0], P['ink'], P['soft']]
     bench_sharpe = perf_table.loc['Sharpe ratio', bench]
     pts = alt.Chart(plot_df).mark_point(filled=True, opacity=1).encode(
         x=alt.X('Annual turnover:Q', axis=alt.Axis(format='.0%'), title='Average annual turnover'),
@@ -549,7 +717,7 @@ with tabs[4]:
     bench_line = alt.Chart(pd.DataFrame({'y': [bench_sharpe], 'label': [f'{bench} benchmark']}))
     bench_rule = bench_line.mark_rule(color=P['muted'], strokeDash=[4, 4]).encode(
         y=alt.Y('y:Q', title='Sharpe ratio'))
-    bench_text =bench_line.mark_text(align='left', dx=4, dy=-7, fontSize=11, color=P['muted']).encode(
+    bench_text = bench_line.mark_text(align='left', dx=4, dy=-7, fontSize=11, color=P['muted']).encode(
         y='y:Q', x=alt.value(4), text='label:N')
     st.altair_chart(alt.layer(bench_rule, bench_text, pts, tags).properties(height=380),
                     alt='Sharpe ratio against annual turnover for thirteen rebalancing rules')
@@ -565,10 +733,8 @@ with tabs[4]:
     st.dataframe(shown, column_config=fmt_cols, width='stretch', height=38 + 35 * len(shown),
                  alt='Performance of the strategy under each rebalancing rule')
 
-# ----------------------------------------------------------------------------------------------------------
-# 6. Calendar years (Section 7)
-# ----------------------------------------------------------------------------------------------------------
-with tabs[5]:
+
+def section_calendar():
     st.subheader('Calendar-year returns')
     cal_src = pd.DataFrame({PP: results['pp_net'], bench: results['bench_6040'], VTI: results['stocks'],
                             'TLT': rets_p['TLT'], 'GLD': rets_p['GLD'], 'AGG': rets_p['AGG'],
@@ -582,7 +748,7 @@ with tabs[5]:
         x=alt.X('Series:N', sort=list(cal.columns), title=None,
                 axis=alt.Axis(orient='top', labelAngle=0, labelLimit=160)),
         y=alt.Y('Year:N', sort=list(cal.index), title=None))
-    rects = cells.mark_rect(cornerRadius=3, stroke=P['mid'], strokeWidth=0).encode(
+    rects = cells.mark_rect(cornerRadius=3).encode(
         color=alt.Color('Return:Q', scale=alt.Scale(domain=[-lim, 0, lim], range=[P['neg'], P['mid'], P['pos']],
                                                     clamp=True, interpolate='lab'),
                         legend=alt.Legend(title='Return', format='.0%', orient='right')),
@@ -594,10 +760,8 @@ with tabs[5]:
                'the chosen period. Blue years are gains, red years losses.')
     show_data(cal, file_name='calendar_returns.csv')
 
-# ----------------------------------------------------------------------------------------------------------
-# 7. Method and data
-# ----------------------------------------------------------------------------------------------------------
-with tabs[6]:
+
+def section_method():
     left, right = st.columns([3, 2], gap='large')
     with left:
         st.subheader('Method')
@@ -615,11 +779,11 @@ with tabs[6]:
             'The assumptions in the sidebar are passed to the same functions the notebook uses. Changing the '
             'period restarts the strategy from equal weights in the first month chosen, which differs from the '
             'sub-period estimates in Section 15 of the notebook, where the full-sample backtest is evaluated '
-            'over shorter windows.')
+            'over shorter windows. The overview sentences, the sleeve leaders and the crisis panels present '
+            'results the notebook reports in its tables.')
 
         st.subheader('Consistency with the notebook')
-        full = rets
-        res_d, _, _ = an.simulate(full)
+        res_d, _, _ = an.simulate(rets)
         table_d, _ = an.performance_tables(res_d)
         reference = notebook_table1()
         gap = (table_d - reference).abs().max().max()
@@ -652,6 +816,24 @@ with tabs[6]:
                 st.link_button('Open in Colab', f'https://colab.research.google.com/github/'
                                f'{REPO_URL.split("github.com/")[1]}/blob/main/{NOTEBOOK_PATH}',
                                icon=':material/play_circle:')
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Views: the client view tells the story; the analyst view has every analysis of the notebook
+# ----------------------------------------------------------------------------------------------------------
+
+if view == 'Client':
+    sections = {'Overview': section_overview, 'Crises': section_crises, 'Four seasons': section_regimes,
+                'Method and data': section_method}
+else:
+    sections = {'Overview': section_overview, 'Performance': section_performance, 'Risk': section_risk,
+                'Rebalancing and costs': section_rebalancing, 'Crises': section_crises,
+                'Rebalancing rules': section_rules, 'Calendar years': section_calendar,
+                'Four seasons': section_regimes, 'Method and data': section_method}
+tabs = st.tabs(list(sections), key=f'tab_{view.lower()}', bind='query-params')
+for tab, render in zip(tabs, sections.values()):
+    with tab:
+        render()
 
 st.divider()
 st.caption('Educational project for 2270 Financial Modeling, Nova SBE. Results are historical simulations, are not '

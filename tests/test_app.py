@@ -11,7 +11,7 @@ OUTPUTS = ROOT / 'notebook' / 'outputs'
 
 
 @pytest.fixture
-def app(monkeypatch):
+def client(monkeypatch):
     monkeypatch.setenv('PP_APP_OFFLINE', '1')
     at = AppTest.from_file(APP, default_timeout=60)
     at.run()
@@ -19,9 +19,23 @@ def app(monkeypatch):
     return at
 
 
+@pytest.fixture
+def app(client):
+    # The analyst view renders every section of the app
+    client.segmented_control(key='view').set_value('Analyst').run()
+    assert not client.exception, client.exception
+    return client
+
+
 def performance_table(at):
-    # The first st.table on the page is the formatted Table 1
-    return at.table[0].value
+    # Table 1 is the table with the stress-cost column
+    return next(t.value for t in at.table if 'PP, stress costs' in t.value.columns)
+
+
+def test_client_view_opens_on_the_overview(client):
+    assert client.segmented_control(key='view').value == 'Client'
+    assert any('In brief' in m.value for m in client.markdown)
+    assert any('reproduces Table 1' in s.value for s in client.success)     # Method and data is in both views
 
 
 def test_default_settings_reproduce_table1(app):
