@@ -1,6 +1,6 @@
 """Functions of the notebook Group_G_Permanent_Portfolio.ipynb, copied without modification.
 
-Every function below is an exact copy of its definition in the notebook (Sections 3 to 9 and 14), so
+Every function below is an exact copy of its definition in the notebook (Sections 3 to 9, 14 and 16), so
 that the Streamlit application computes its results with the same code as the notebook.
 tests/test_consistency.py fails if any copy differs from the notebook by a single character.
 """
@@ -147,3 +147,28 @@ def months_to_recover(wealth, peak, trough):
         if wealth.iloc[i] >= peak_value:
             return i - dates.index(peak)
     return np.nan
+
+
+def download_cpi(start, end):
+    # US consumer price index (FRED CPIAUCNS: CPI-U, all items, not seasonally adjusted) on the monthly calendar
+    last_month = (pd.Timestamp(end) - pd.DateOffset(months=1)).strftime('%Y-%m-%d')
+    url = ('https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCNS'
+           f'&cosd={start}&coed={last_month}')
+    cpi = pd.read_csv(url, index_col=0, parse_dates=True, na_values='.')['CPIAUCNS']
+    cpi = cpi.reindex(pd.date_range(start, end, freq='MS', inclusive='left'))
+
+    # October 2025 was not published (no price collection during the federal shutdown). As in the BLS's own
+    # seasonal adjustment, its level is the geometric mean of September and November.
+    gap = pd.Timestamp('2025-10-01')
+    before, after = gap - pd.DateOffset(months=1), gap + pd.DateOffset(months=1)
+    if before in cpi.index and after in cpi.index and pd.isna(cpi[gap]):
+        cpi[gap] = np.sqrt(cpi[before] * cpi[after])
+
+    if cpi.isna().any():
+        raise ValueError(f"Missing consumer price index in: {list(cpi.index[cpi.isna()].strftime('%Y-%m'))}")
+    return cpi
+
+
+def real_returns(r, inflation):
+    # Returns in real terms, (1 + r) / (1 + inflation) - 1, for every column of r
+    return (1 + r).div(1 + inflation, axis=0) - 1

@@ -1,10 +1,11 @@
 """Calculations of the notebook's result cells, written as functions of the model parameters.
 
 core.py holds exact copies of the notebook's functions. This module repeats the code of the cells that
-use them (Sections 7, 8, 10, 13, 14 and 15), with the parameters of Section 2 as arguments, so that the
-application can re-run the analysis under the assumptions chosen by the user. tests/test_consistency.py
-checks that, at the notebook's settings, every function reproduces the tables the notebook saved in
-notebook/outputs/.
+use them (Sections 7, 8, 10 and 13 to 16), with the parameters of Section 2 as arguments, so that the
+application can re-run the analysis under the assumptions chosen by the user. In real terms, the application
+passes the return panel deflated by core.real_returns to the same functions, as Section 16 does.
+tests/test_consistency.py checks that, at the notebook's settings, every function reproduces the tables the
+notebook saved in notebook/outputs/.
 """
 import numpy as np
 import pandas as pd
@@ -20,6 +21,8 @@ CHECK_MONTHS = list(range(1, 13))
 W_STOCKS_BENCH = 0.60
 COST, COST_STRESS = 0.0005, 0.005
 PERIODS = 12
+CPI_START = '2004-01-01'            # Section 16: the price index from twelve months before the first return
+INFLATION_BOUNDS = (0.01, 0.03)     # Section 16: thresholds of the low, moderate and high inflation regimes
 
 SLEEVES = ['Equities', 'Long-term Treasuries', 'Gold', 'Treasury bills']
 REVIEW_SCHEDULES = {'Monthly': list(range(1, 13)), 'Quarterly': [3, 6, 9, 12],
@@ -200,3 +203,45 @@ def rule_comparison(rets, results, cost=COST, band_low=BAND_LOW, band_high=BAND_
 def calendar_returns(df):
     # Section 7: compounded return of each calendar year (a partial year covers the months in the sample)
     return (1 + df).groupby(df.index.year).prod() - 1
+
+
+def inflation_rates(cpi, index):
+    # Section 16: monthly inflation and inflation over the preceding twelve months, on the months of the panel
+    monthly = cpi.pct_change(fill_method=None).loc[index]
+    annual = cpi.pct_change(12, fill_method=None).loc[index]
+    return monthly, annual
+
+
+def inflation_regimes(real_rets, real_results, inflation_12m, bounds=INFLATION_BOUNDS, bench='60/40'):
+    # Section 16: annualized compound real return of each sleeve and portfolio in the months of low, moderate
+    # and high inflation over the preceding twelve months; also returns the regime of each month
+    bound_low, bound_high = bounds
+    labels = [f'Low ({100 * bound_low:g}% or less)', f'Moderate ({100 * bound_low:g}% to {100 * bound_high:g}%)',
+              f'High (above {100 * bound_high:g}%)']
+    regime = pd.cut(inflation_12m, [-np.inf, bound_low, bound_high, np.inf], labels=labels)
+
+    series = {'Equities (VTI)': real_rets['VTI'], 'Long-term Treasuries (TLT)': real_rets['TLT'],
+              'Gold (GLD)': real_rets['GLD'], 'Treasury bills': real_rets['rf'],
+              'Permanent Portfolio': real_results['pp_net'], bench: real_results['bench_6040'],
+              'Aggregate bonds (AGG)': real_rets['AGG']}
+    table = pd.DataFrame(index=labels)
+    for name in series:
+        r = series[name]
+        table[name] = [(1 + r[regime == k]).prod() ** (PERIODS / (regime == k).sum()) - 1
+                       if (regime == k).any() else np.nan for k in labels]
+    table['Months'] = [int((regime == k).sum()) for k in labels]
+    table['Average 12-month inflation'] = [inflation_12m[regime == k].mean() for k in labels]
+    return table.T, regime
+
+
+def calendar_real_returns(real_rets, real_results, inflation, bench='60/40'):
+    # Section 16: calendar-year inflation (December to December) and real returns
+    return calendar_returns(pd.DataFrame({
+        'Inflation': inflation,
+        'Permanent Portfolio': real_results['pp_net'],
+        bench: real_results['bench_6040'],
+        'All equity (VTI)': real_rets['VTI'],
+        'Long-term Treasuries (TLT)': real_rets['TLT'],
+        'Gold (GLD)': real_rets['GLD'],
+        'Treasury bills': real_rets['rf'],
+    }))

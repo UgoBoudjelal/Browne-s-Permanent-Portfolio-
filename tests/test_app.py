@@ -89,3 +89,57 @@ def test_reset_restores_the_notebook_settings(app):
     assert not app.exception
     assert app.slider(key='cost').value == 0.05
     assert any('reproduces Table 1' in s.value for s in app.success)
+
+
+# Real terms (Section 16 of the notebook)
+
+def test_real_view_reproduces_the_real_terms_table(app):
+    app.segmented_control(key='terms').set_value('Real').run()
+    assert not app.exception
+    shown = performance_table(app).replace('–', '-')
+    expected = pd.read_csv(OUTPUTS / 'table1_real_terms_formatted.csv', index_col=0).fillna('-')
+    assert (shown.values == expected.values).all()
+    table = pd.read_csv(OUTPUTS / 'table1_real_terms.csv', index_col=0)
+    sharpe = next(m for m in app.metric if m.label == 'Sharpe ratio')
+    assert sharpe.value == f"{table.loc['Sharpe ratio', 'Permanent Portfolio']:.2f}"
+    assert any(m.label.startswith('Real value of') for m in app.metric)
+
+
+def test_method_checks_both_tables(app):
+    messages = [s.value for s in app.success]
+    assert any('reproduces Table 1' in m for m in messages)
+    assert any('real-terms Table 1 of Section 16' in m for m in messages)
+
+
+def test_inflation_tab_summarizes_the_regimes(app):
+    briefs = [m.value for m in app.markdown if 'US consumer prices rose by' in m.value]
+    assert briefs
+    regimes = pd.read_csv(OUTPUTS / 'inflation_regimes.csv', index_col=0)
+    high = regimes.loc['Permanent Portfolio', 'High (above 3%)']
+    assert any(f'{high:.1%}' in b for b in briefs)
+
+
+@pytest.mark.parametrize('rule', ['Tolerance band', 'Calendar reset', 'Buy and hold'])
+def test_every_rule_runs_in_real_terms(app, rule):
+    app.segmented_control(key='terms').set_value('Real')
+    app.segmented_control(key='rule').set_value(rule)
+    app.run()
+    assert not app.exception
+
+
+def test_inflation_thresholds_and_a_period_without_low_inflation(app):
+    # Twelve-month inflation never fell to 1% between 2021 and 2026, so the low regime is empty
+    app.select_slider(key='period').set_value(('2021-01', '2026-10')).run()
+    assert not app.exception
+    assert any('No month of the chosen period' in c.value for c in app.caption)
+    app.slider(key='inflation_bounds').set_value((2.0, 4.0)).run()
+    assert not app.exception
+    app.slider(key='inflation_bounds').set_value((3.0, 3.0)).run()
+    assert not app.exception
+    assert any('lower threshold below the upper' in i.value for i in app.info)
+
+
+def test_client_view_in_real_terms(client):
+    client.segmented_control(key='terms').set_value('Real').run()
+    assert not client.exception
+    assert any('after inflation' in m.value for m in client.markdown)

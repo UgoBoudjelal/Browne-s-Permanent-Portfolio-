@@ -2,7 +2,7 @@
 
 Run locally with `streamlit run app.py`. Every number is computed with core.py (exact copies of the
 notebook's functions) and analysis.py (the notebook's result cells as functions of the assumptions);
-tests/ verifies that the default settings reproduce the notebook's tables.
+tests/ verifies that the default settings reproduce the notebook's tables, in nominal and in real terms.
 """
 import os
 from pathlib import Path
@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 import analysis as an
-from core import format_table, load_data
+from core import download_cpi, format_table, load_data, real_returns
 
 ROOT = Path(__file__).resolve().parent
 OUTPUTS = ROOT / 'notebook' / 'outputs'
@@ -33,6 +33,8 @@ SLEEVES = ['Equities (VTI)', 'Long-term Treasuries (TLT)', 'Gold (GLD)', 'Treasu
 SLEEVE_COLS = ['VTI', 'TLT', 'GLD', 'rf']
 SEASONS = {'Equities (VTI)': 'Prosperity', 'Long-term Treasuries (TLT)': 'Deflation',
            'Gold (GLD)': 'Inflation', 'Treasury bills': 'Recession'}
+SHORT = {'Equities (VTI)': 'equities', 'Long-term Treasuries (TLT)': 'long-term Treasuries', 'Gold (GLD)': 'gold',
+         'Treasury bills': 'Treasury bills'}
 
 # "Four regimes" palette, validated for colour-blind safety in both themes. Portfolios: the Permanent
 # Portfolio in magenta, the stock-bond benchmark in blue, VTI in the equity sleeve's green. Sleeves: one colour
@@ -55,31 +57,35 @@ P = PALETTE['dark' if theme_type == 'dark' else 'light']
 # Data: one download for the whole sample, cached; the notebook's saved returns if the sources are busy
 # ----------------------------------------------------------------------------------------------------------
 
-@st.cache_data(show_spinner='Downloading monthly prices (Yahoo Finance) and the T-bill rate (FRED)...')
-def live_returns():
+@st.cache_data(show_spinner='Downloading monthly prices (Yahoo Finance), the T-bill rate and consumer prices '
+                             '(FRED)...')
+def live_data():
     _, rets = load_data(an.START, an.END, an.TICKERS)
-    return rets
+    cpi = download_cpi(an.CPI_START, an.END)
+    return rets, cpi
 
 
 @st.cache_data(show_spinner=False)
-def saved_returns():
-    return pd.read_csv(OUTPUTS / 'returns_monthly.csv', index_col=0, parse_dates=True)
+def saved_data():
+    rets = pd.read_csv(OUTPUTS / 'returns_monthly.csv', index_col=0, parse_dates=True)
+    cpi = pd.read_csv(OUTPUTS / 'consumer_prices.csv', index_col=0, parse_dates=True)['CPI']
+    return rets, cpi
 
 
 @st.cache_data(show_spinner=False)
-def notebook_table1():
-    return pd.read_csv(OUTPUTS / 'table1_performance.csv', index_col=0)
+def notebook_table(name):
+    return pd.read_csv(OUTPUTS / name, index_col=0)
 
 
-def get_returns():
+def get_data():
     if os.environ.get('PP_APP_OFFLINE') == '1' or st.session_state.get('use_saved_data'):
-        return saved_returns(), 'saved'
+        return *saved_data(), 'saved'
     try:
-        return live_returns(), 'live'
+        return *live_data(), 'live'
     except Exception as exc:                       # rate limit, network error or failed calendar check
         st.session_state['use_saved_data'] = True
         st.session_state['data_error'] = f'{type(exc).__name__}: {exc}'
-        return saved_returns(), 'saved'
+        return *saved_data(), 'saved'
 
 
 @st.cache_data(show_spinner=False)
@@ -101,12 +107,18 @@ def signed_pp(x):
     return f'{100 * x:+.2f} pp'
 
 
+def threshold(x):
+    # An inflation threshold as written in the regime labels, e.g. 0.03 -> '3%'
+    return f'{100 * x:g}%'
+
+
 def table_text(df):
     # st.table renders cells as Markdown, where a lone '-' (format_table's "not applicable") becomes a bullet
     return df.map(lambda v: '–' if v == '-' else v)
 
 
-def time_chart(wide, fmt, y_title, key, colors, log=False, under=(), over=(), height=340, y_domain=None):
+def time_chart(wide, fmt, y_title, key, colors, log=False, under=(), over=(), height=340, y_domain=None, dashed=(),
+               legend=True):
     """Lines over time with a hover crosshair; the tooltip lists every series at the hovered month."""
     names = list(wide.columns)
     data = wide.rename_axis('Date').reset_index()
@@ -115,7 +127,7 @@ def time_chart(wide, fmt, y_title, key, colors, log=False, under=(), over=(), he
     safe.columns = ['Date'] + [f's{i}' for i in range(len(names))]
 
     color = alt.Color('Series:N', scale=alt.Scale(domain=names, range=colors[:len(names)]),
-                      legend=alt.Legend(title=None, orient='top', direction='horizontal'))
+                      legend=alt.Legend(title=None, orient='top', direction='horizontal') if legend else None)
     if log:
         scale = alt.Scale(type='log')
     elif y_domain is not None:
@@ -126,8 +138,11 @@ def time_chart(wide, fmt, y_title, key, colors, log=False, under=(), over=(), he
     hover = alt.selection_point(name=f'{key}_hover', fields=['Date'], on='pointerover', clear='pointerout',
                                 empty=False)
 
-    lines = alt.Chart(long).mark_line(strokeWidth=2).encode(
-        x=x, y=alt.Y('Value:Q', title=y_title, scale=scale, axis=alt.Axis(format=fmt)), color=color)
+    encoding = dict(x=x, y=alt.Y('Value:Q', title=y_title, scale=scale, axis=alt.Axis(format=fmt)), color=color)
+    if dashed:
+        encoding['strokeDash'] = alt.StrokeDash('Series:N', legend=None, scale=alt.Scale(
+            domain=names, range=[[6, 4] if n in dashed else [1, 0] for n in names]))
+    lines = alt.Chart(long).mark_line(strokeWidth=2).encode(**encoding)
     tooltip = [alt.Tooltip('Date:T', title='Month', format='%b %Y')] + \
               [alt.Tooltip(f's{i}:Q', title=n, format=fmt) for i, n in enumerate(names)]
     targets = alt.Chart(safe).mark_rule(strokeWidth=8, opacity=0).encode(x='Date:T', tooltip=tooltip) \
@@ -183,8 +198,12 @@ st.caption("Four assets for four economic seasons: Harry Browne's Permanent Port
            "equities, long-term Treasuries, gold and Treasury bills. Backtested on monthly data and compared with a "
            "stock–bond benchmark. Group G · 2270 Financial Modeling · Nova SBE.")
 
-rets, source = get_returns()
+rets, cpi, source = get_data()
 MONTHS = list(rets.index.strftime('%Y-%m'))
+
+# Section 16: inflation and the return panel in real terms (every series deflated by the month's inflation)
+inflation, inflation_12m = an.inflation_rates(cpi, rets.index)
+real_rets = real_returns(rets, inflation)
 
 
 def month_label(m):
@@ -271,28 +290,35 @@ with st.container(horizontal=True, vertical_alignment='center'):
         st.badge("Notebook's assumptions", icon=':material/verified:', color='primary')
     else:
         st.badge('Custom assumptions', icon=':material/tune:', color='violet')
-    st.caption(f'Rule: {rule_text} · cost {cost:.2%} per side · benchmark {bench} VTI/AGG · '
-               f'{month_label(first)} to {month_label(last)}')
     st.space('stretch')
+    terms = st.segmented_control('Returns', ['Nominal', 'Real'], default='Nominal', required=True, key='terms',
+                                 bind='query-params', label_visibility='collapsed',
+                                 help='Nominal: returns in US dollars. Real: returns after US consumer-price '
+                                      'inflation, with values at the prices of the month in which the money is '
+                                      'invested.')
     view = st.segmented_control('View', ['Client', 'Analyst'], default='Client', required=True, key='view',
                                 bind='query-params', label_visibility='collapsed',
                                 help='Client: the key results in plain language. Analyst: every table and '
                                      'analysis of the notebook.')
+REAL = terms == 'Real'
+st.caption(f'Rule: {rule_text} · cost {cost:.2%} per side · benchmark {bench} VTI/AGG · '
+           f'{month_label(first)} to {month_label(last)}' + (' · returns after inflation' if REAL else ''))
 
 if st.session_state.get('data_error') and source == 'saved':
     with st.container(border=True):
-        st.warning('Yahoo Finance or FRED did not respond, so the page uses the monthly returns saved by the '
-                   "notebook's own run, which cover the same months. Live data can be retried in a minute.",
-                   title='Data source busy, try again', icon=':material/cloud_off:')
+        st.warning('Yahoo Finance or FRED did not respond, so the page uses the monthly returns and consumer prices '
+                   "saved by the notebook's own run, which cover the same months. Live data can be retried in a "
+                   'minute.', title='Data source busy, try again', icon=':material/cloud_off:')
 
         def retry():
             st.session_state['use_saved_data'] = False
             st.session_state['data_error'] = None
-            live_returns.clear()
+            live_data.clear()
 
         st.button('Try live data again', on_click=retry, icon=':material/refresh:', key='retry')
 
-rets_p = rets.loc[first:last]
+nominal_p, real_p = rets.loc[first:last], real_rets.loc[first:last]
+rets_p = real_p if REAL else nominal_p            # every section below follows the choice of returns
 if len(rets_p) < 36:
     st.warning('Choose a period of at least 36 months: shorter samples give unreliable estimates of '
                'volatility, beta and alpha.', icon=':material/date_range:')
@@ -302,8 +328,13 @@ if len(rets_p) < 36:
 # Model: the notebook's calculations under the chosen assumptions
 # ----------------------------------------------------------------------------------------------------------
 
-results, weights_after, weights_before = an.simulate(rets_p, low, high, check, cost, cost_stress, w_bench)
+# Both runs are kept: the chosen one drives every section, and the Inflation tab compares the two
+runs = {t: an.simulate(p, low, high, check, cost, cost_stress, w_bench) for t, p in
+        (('Nominal', nominal_p), ('Real', real_p))}
+results, weights_after, weights_before = runs[terms]
+results_nom, results_real = runs['Nominal'][0], runs['Real'][0]
 perf_table, perf_vs_stocks = an.performance_tables(results, bench)
+perf_real = perf_table if REAL else an.performance_tables(results_real, bench)[0]
 levels = sorted(set(an.COST_LEVELS + [cost, cost_stress]))
 with np.errstate(divide='ignore'):            # without trades the break-even cost is undefined
     cost_summary, sensitivity = an.cost_analysis(results, cost, cost_stress, levels)
@@ -316,17 +347,25 @@ names3 = [PP, bench, VTI]
 growth = pd.DataFrame({PP: an.wealth_index(results['pp_net']), bench: an.wealth_index(results['bench_6040']),
                        VTI: an.wealth_index(results['stocks'])})          # value of $1, from 1 the month before
 wealth = growth * amount
-start_label = f'{(rets_p.index[0] - pd.DateOffset(months=1)):%B %Y}'
+start_ts = rets_p.index[0] - pd.DateOffset(months=1)        # the month-end at which the money is invested
+start_label, end_label = f'{start_ts:%B %Y}', f'{rets_p.index[-1]:%B %Y}'
+REAL_NOTE = ' All returns are after US consumer-price inflation.' if REAL else ''
+
+# Consumer prices over the chosen period (Section 16)
+cpi_p = cpi.loc[start_ts:rets_p.index[-1]]
+price_rise = cpi_p.iloc[-1] / cpi_p.iloc[0] - 1
+inflation_rate = (1 + price_rise) ** (an.PERIODS / len(rets_p)) - 1
+inflation_p, inflation_12m_p = inflation.loc[first:last], inflation_12m.loc[first:last]
 
 # KPI row: the Permanent Portfolio net of costs, with the difference from the frictionless benchmark
 pp_m, b_m = perf_table[PP], perf_table[bench]
 final_pp, final_b = amount * pp_m['Growth of $1'], amount * b_m['Growth of $1']
 diff_final = final_pp - final_b
 with st.container(horizontal=True):
-    st.metric(f'Value of ${amount:,.0f}', f'${final_pp:,.0f}',
+    st.metric(f'Real value of ${amount:,.0f}' if REAL else f'Value of ${amount:,.0f}', f'${final_pp:,.0f}',
               f"{'+' if diff_final >= 0 else '-'}${abs(diff_final):,.0f}", delta_description=f'vs {bench}',
-              border=True)
-    st.metric('Compound annual return', pct(pp_m['Compound annual return']),
+              help=f'At {start_label} prices' if REAL else None, border=True)
+    st.metric('Real compound annual return' if REAL else 'Compound annual return', pct(pp_m['Compound annual return']),
               signed_pp(pp_m['Compound annual return'] - b_m['Compound annual return']),
               delta_description=f'vs {bench}', border=True)
     st.metric('Annualized volatility', pct(pp_m['Annualized volatility']),
@@ -337,6 +376,9 @@ with st.container(horizontal=True):
     st.metric('Maximum drawdown', pct(pp_m['Maximum drawdown']),
               signed_pp(pp_m['Maximum drawdown'] - b_m['Maximum drawdown']), delta_color='inverse',
               delta_description=f'vs {bench}', border=True)
+if REAL:
+    st.caption(f'After inflation: every return is deflated by US consumer prices (CPI-U), and values are at '
+               f'{start_label} prices.')
 
 
 # ----------------------------------------------------------------------------------------------------------
@@ -347,12 +389,13 @@ def section_overview():
     # The key results in plain sentences, written from the computed numbers
     v_m = perf_table[VTI]
     lines = [
-        f"From the end of {start_label} to the end of {pd.Timestamp(last + '-01'):%B %Y}, ${amount:,.0f} in the "
-        f"Permanent Portfolio grew to "
-        f"**${final_pp:,.0f}**, a compound return of {pct(pp_m['Compound annual return'])} a year, against "
+        f"From the end of {start_label} to the end of {end_label}, ${amount:,.0f} in the Permanent Portfolio grew to "
+        f"**${final_pp:,.0f}**{f' at {start_label} prices' if REAL else ''}, a {'real ' if REAL else ''}compound "
+        f"return of {pct(pp_m['Compound annual return'])} a year, against "
         f"${final_b:,.0f} ({pct(b_m['Compound annual return'])}) for the {bench} and "
         f"${amount * v_m['Growth of $1']:,.0f} ({pct(v_m['Compound annual return'])}) for an all-equity portfolio.",
-        f"Its largest fall from a previous peak was **{pct(pp_m['Maximum drawdown'], 1)}**, against "
+        f"Its largest fall {'in purchasing power ' if REAL else ''}from a previous peak was "
+        f"**{pct(pp_m['Maximum drawdown'], 1)}**, against "
         f"{pct(b_m['Maximum drawdown'], 1)} for the {bench} and {pct(v_m['Maximum drawdown'], 1)} for equities, "
         f"with an annualized volatility of {pct(pp_m['Annualized volatility'], 1)} against "
         f"{pct(b_m['Annualized volatility'], 1)}.",
@@ -372,25 +415,35 @@ def section_overview():
         lines.append(f"It did better than the {bench} in **{how_many}** equity crises of the period; {tail}.")
     lines.append(f"Per unit of risk it earned a Sharpe ratio of **{pp_m['Sharpe ratio']:.2f}**, against "
                  f"{b_m['Sharpe ratio']:.2f} for the {bench}.")
+    if REAL:
+        lines.append(f"US consumer prices rose by {pct(price_rise, 1)} over the period, {pct(inflation_rate)} a year; "
+                     f"every value on this page is after inflation, at {start_label} prices.")
+    else:
+        lines.append(f"US consumer prices rose by {pct(price_rise, 1)} over the period, {pct(inflation_rate)} a year, "
+                     f"so after inflation the Permanent Portfolio grew by "
+                     f"{pct(perf_real.loc['Compound annual return', PP])} a year, against "
+                     f"{pct(perf_real.loc['Compound annual return', bench])} for the {bench}. Select *Real* at the "
+                     "top of the page to see every result after inflation.")
     with st.container(border=True):
         st.markdown('#### In brief')
         st.markdown('\n'.join(f'- {s}' for s in lines))
         st.caption(f'Permanent Portfolio net of {cost:.2%} costs per side; {bench} before costs. The sentences '
-                   'update with the assumptions in the sidebar.')
+                   'update with the assumptions in the sidebar.' + REAL_NOTE)
 
-    st.subheader(f'Value of ${amount:,.0f} invested at the end of {start_label}')
+    st.subheader(f'{"Real value" if REAL else "Value"} of ${amount:,.0f} invested at the end of {start_label}')
     with st.container(horizontal=True, vertical_alignment='center'):
         st.space('stretch')
         log_scale = st.toggle('Log scale', key='log_scale')
         show_marks = st.toggle('Rebalancing dates', key='show_marks', value=True)
     shade, labels = crisis_shading(crisis_table)
     under = shade + ([vertical_marks(rebalance_dates)] if show_marks and 0 < len(rebalance_dates) <= 60 else [])
-    st.altair_chart(time_chart(wealth, '$,.0f', 'Portfolio value (USD)', 'wealth', colors3, log=log_scale,
+    y_title = f'Value at {start_ts:%b %Y} prices (USD)' if REAL else 'Portfolio value (USD)'
+    st.altair_chart(time_chart(wealth, '$,.0f', y_title, 'wealth', colors3, log=log_scale,
                                under=under, over=labels, height=400),
                     alt=f'Growth of ${amount:,.0f} in the Permanent Portfolio, the {bench} benchmark and VTI, with '
                         'the equity crises shaded')
     st.caption('Shaded: equity crises, from the equity peak to the trough. Dashed lines: months in which the '
-               'portfolio was rebalanced back to 25% each.')
+               'portfolio was rebalanced back to 25% each.' + REAL_NOTE)
     show_data(wealth.round(2), file_name='portfolio_values.csv')
 
     left, right = st.columns([3, 2], gap='large')
@@ -410,11 +463,13 @@ def section_overview():
 
 
 def section_performance():
-    st.subheader('Performance measures')
+    st.subheader('Performance measures after inflation' if REAL else 'Performance measures')
     st.caption(f'{month_label(first)} to {month_label(last)}. Permanent Portfolio net of {cost:.2%} (base) and '
                f'{cost_stress:.2%} (stress) costs per side; the benchmark without and with base costs. Beta, alpha, '
                f'tracking error and information ratio are measured against the frictionless {bench}; beta is not '
-               'annualized.')
+               'annualized.' + (' All returns are after US consumer-price inflation, and the Sharpe ratio and alpha '
+                                'are measured against the real return of Treasury bills (Section 16 of the '
+                                'notebook).' if REAL else ''))
     st.table(table_text(format_table(perf_table)), alt='Performance measures of the portfolios')
     with st.container(horizontal=True):
         with st.container(border=True):
@@ -452,7 +507,7 @@ def section_risk():
         rolling = pd.DataFrame({n: series[n].rolling(36).std() * np.sqrt(an.PERIODS) for n in series}).dropna()
         st.altair_chart(time_chart(rolling, '.0%', 'Annualized volatility', 'roll', colors3, height=300),
                         alt='Rolling 36-month volatility of the three portfolios')
-        st.caption('Standard deviation of the previous 36 monthly returns, annualized.')
+        st.caption('Standard deviation of the previous 36 monthly returns, annualized.' + REAL_NOTE)
     with right:
         st.subheader('Risk and return')
         assets = {PP: results['pp_net'], bench: results['bench_6040'], VTI: results['stocks'],
@@ -479,7 +534,7 @@ def section_risk():
             text='Portfolio or asset:N', color=alt.value(P['ink'])).transform_filter(alt.datum.Side == 'below')
         st.altair_chart(alt.layer(points, label_right, label_left, label_below).properties(height=300),
                         alt='Annualized mean return against volatility for the portfolios and their constituents')
-        st.caption('The three portfolios in colour; the constituents and the bond index in grey.')
+        st.caption('The three portfolios in colour; the constituents and the bond index in grey.' + REAL_NOTE)
     show_data(rr.drop(columns=['Colour', 'Side']).set_index('Portfolio or asset'), 'Show risk and return data')
 
 
@@ -531,7 +586,7 @@ def section_rebalancing():
     st.table(table_text(format_table(sensitivity.loc[rows_shown])), alt='Performance by cost rate per side')
     st.caption(f'Cost per dollar traded, on each side of a trade. Alpha and information ratio relative to the '
                f'{bench}. Because costs enter returns linearly, alpha falls in a straight line as the cost rate '
-               'rises; the break-even cost is the rate at which it reaches zero.')
+               'rises; the break-even cost is the rate at which it reaches zero.' + REAL_NOTE)
 
 
 def section_crises():
@@ -561,7 +616,8 @@ def section_crises():
     st.altair_chart(small, alt='Value of each portfolio from the equity peak, in each of the five crises')
     st.caption('Each panel starts at the equity peak (value 100) and runs to two years after the equity trough. '
                'The crises are dated as in Section 14 of the notebook: the lowest month-end of VTI within a search '
-               'window and the highest month-end before it.')
+               'window and the highest month-end before it.' +
+               (' After inflation, both the dates and the returns are those of real wealth.' if REAL else ''))
 
     st.subheader('Return from the equity peak to the equity trough')
     bars = crisis_table[names3].reset_index().melt('Episode', var_name='Portfolio', value_name='Return')
@@ -626,7 +682,8 @@ def section_regimes():
         st.altair_chart(alt.layer(tiles, marker, season, sleeve).properties(height=330),
                         alt="Browne's four economic seasons and the sleeve meant for each")
         st.caption('Browne (1999) argues that each asset does well in a different economic season, so holding all '
-                   'four in equal parts means the portfolio does not depend on predicting which season comes next.')
+                   'four in equal parts means the portfolio does not depend on predicting which season comes next. '
+                   'The Inflation tab tests the inflation and deflation seasons against the data.')
     with right:
         st.subheader('Which sleeve led each year')
         cal = an.calendar_returns(rets_p[SLEEVE_COLS])
@@ -645,16 +702,14 @@ def section_regimes():
         st.altair_chart(strip, alt='The best-performing sleeve in each calendar year, coloured as in the '
                                    'four-seasons graphic')
         wins = best.value_counts()
-        short = {'Equities (VTI)': 'equities', 'Long-term Treasuries (TLT)': 'long-term Treasuries',
-                 'Gold (GLD)': 'gold', 'Treasury bills': 'Treasury bills'}
         st.caption('Each bar is a calendar year, coloured by the sleeve with the best return that year (colours as '
                    'in the four seasons). '
                    'Best calendar-year return among the four sleeves: '
-                   + '; '.join(f'{short[s]} {int(wins.get(s, 0))} {"year" if wins.get(s, 0) == 1 else "years"}'
+                   + '; '.join(f'{SHORT[s]} {int(wins.get(s, 0))} {"year" if wins.get(s, 0) == 1 else "years"}'
                                for s in SLEEVES)
                    + '. * Partial year.')
 
-        st.subheader('Calendar-year returns of each sleeve')
+        st.subheader('Calendar-year real returns of each sleeve' if REAL else 'Calendar-year returns of each sleeve')
         grid = st.columns(2)
         for i, s in enumerate(SLEEVES):
             df = pd.DataFrame({'Year': lead['Year'], 'Return': cal[s].values})
@@ -673,7 +728,7 @@ def section_rules():
     st.subheader('The strategy under alternative rebalancing rules')
     st.caption(f'Each rule is simulated with the same engine over the chosen period, net of {cost:.2%} costs per '
                f'side; alpha and the information ratio are relative to the {bench}. The strategy uses Browne\'s '
-               'tolerance band of 15–35%, reviewed monthly.')
+               'tolerance band of 15–35%, reviewed monthly.' + REAL_NOTE)
     rules_tbl = rule_table(rets_p, cost, w_bench).copy()
 
     # Locate the current settings in the grid, or add them as a row of their own
@@ -736,30 +791,221 @@ def section_rules():
 
 
 def section_calendar():
-    st.subheader('Calendar-year returns')
+    st.subheader('Calendar-year real returns' if REAL else 'Calendar-year returns')
     cal_src = pd.DataFrame({PP: results['pp_net'], bench: results['bench_6040'], VTI: results['stocks'],
                             'TLT': rets_p['TLT'], 'GLD': rets_p['GLD'], 'AGG': rets_p['AGG'],
                             'T-bills': rets_p['rf']})
     cal = an.calendar_returns(cal_src)
+    cal['Inflation (CPI)'] = an.calendar_returns(inflation_p.to_frame('Inflation'))['Inflation']
     counts = cal_src.groupby(cal_src.index.year).size()
     cal.index = [f'{y}*' if counts[y] < 12 else str(y) for y in cal.index]
     heat = cal.rename_axis('Year').reset_index().melt('Year', var_name='Series', value_name='Return')
-    lim = float(min(0.4, heat['Return'].abs().max()))
-    cells = alt.Chart(heat).encode(
-        x=alt.X('Series:N', sort=list(cal.columns), title=None,
-                axis=alt.Axis(orient='top', labelAngle=0, labelLimit=160)),
-        y=alt.Y('Year:N', sort=list(cal.index), title=None))
-    rects = cells.mark_rect(cornerRadius=3).encode(
+    returns_only = heat[heat['Series'] != 'Inflation (CPI)']
+    lim = float(min(0.4, returns_only['Return'].abs().max()))
+    x = alt.X('Series:N', sort=list(cal.columns), title=None,
+              axis=alt.Axis(orient='top', labelAngle=0, labelLimit=120, labelOverlap=False,
+                            labelExpr=f"datum.label == '{PP}' ? ['Permanent', 'Portfolio'] : datum.label"))
+    y = alt.Y('Year:N', sort=list(cal.index), title=None)
+    rects = alt.Chart(returns_only).mark_rect(cornerRadius=3).encode(
+        x=x, y=y,
         color=alt.Color('Return:Q', scale=alt.Scale(domain=[-lim, 0, lim], range=[P['neg'], P['mid'], P['pos']],
                                                     clamp=True, interpolate='lab'),
-                        legend=alt.Legend(title='Return', format='.0%', orient='right')),
+                        legend=alt.Legend(title='Return', format='.0%', orient='bottom', direction='horizontal',
+                                          gradientLength=220)),
         tooltip=['Year', 'Series', alt.Tooltip('Return:Q', format='.1%')])
-    text = cells.mark_text(fontSize=11, color=P['ink']).encode(text=alt.Text('Return:Q', format='.1%'))
-    st.altair_chart((rects + text).properties(height=24 * len(cal) + 40),
-                    alt='Calendar-year returns of the portfolios and of each asset')
+    # Inflation is shown for reference, on a neutral background rather than on the scale of returns
+    rects_cpi = alt.Chart(heat[heat['Series'] == 'Inflation (CPI)']).mark_rect(
+        cornerRadius=3, color=P['mid'], stroke=P['soft'], strokeWidth=1).encode(
+        x=x, y=y, tooltip=['Year', alt.Tooltip('Return:Q', title='Inflation', format='.1%')])
+    text = alt.Chart(heat).mark_text(fontSize=11, color=P['ink']).encode(
+        x=x, y=y, text=alt.Text('Return:Q', format='.1%'))
+    st.altair_chart(alt.layer(rects, rects_cpi, text).properties(height=24 * len(cal) + 80),
+                    alt='Calendar-year returns of the portfolios and of each asset, with the inflation of each year')
     st.caption('Portfolio returns net of costs for the Permanent Portfolio. * Partial year: only the months inside '
-               'the chosen period. Blue years are gains, red years losses.')
+               'the chosen period. Blue years are gains, red years losses. Inflation (CPI): the change in US consumer '
+               'prices over the same months, for reference.' + REAL_NOTE)
     show_data(cal, file_name='calendar_returns.csv')
+
+
+def section_inflation():
+    # Section 16 of the notebook for the chosen period: purchasing power, real returns and inflation regimes
+    r_pp, r_b = perf_real[PP], perf_real[bench]
+    kpi = st.columns(4)
+    kpi[0].metric('Rise in consumer prices', pct(price_rise, 1), border=True,
+                  help=f'US consumer price index (CPI-U) from {start_label} to {end_label}')
+    kpi[1].metric('Average inflation', pct(inflation_rate), border=True,
+                  help='Compound annual rate of inflation over the period')
+    kpi[2].metric('Real compound return', pct(r_pp['Compound annual return']),
+                  signed_pp(r_pp['Compound annual return'] - r_b['Compound annual return']),
+                  delta_description=f'vs {bench}', border=True,
+                  help='Compound annual return of the Permanent Portfolio after inflation')
+    kpi[3].metric('Largest real drawdown', pct(r_pp['Maximum drawdown']),
+                  signed_pp(r_pp['Maximum drawdown'] - r_b['Maximum drawdown']), delta_color='inverse',
+                  delta_description=f'vs {bench}', border=True,
+                  help='The largest loss of purchasing power of the Permanent Portfolio from a previous peak')
+    brief = st.container(border=True)          # filled at the end, once the regimes are computed
+
+    st.subheader('Keeping ahead of inflation')
+    values = amount * pd.DataFrame({PP: an.wealth_index(results_nom['pp_net']),
+                                    bench: an.wealth_index(results_nom['bench_6040']),
+                                    VTI: an.wealth_index(results_nom['stocks'])})
+    values['US consumer prices'] = amount * cpi_p / cpi_p.iloc[0]
+    st.altair_chart(time_chart(values, '$,.0f', 'Value (USD)', 'keep', colors3 + [P['muted']],
+                               dashed=['US consumer prices'], height=360),
+                    alt=f'Nominal value of ${amount:,.0f} in each portfolio against the amount needed to keep pace '
+                        'with consumer prices')
+    st.caption(f'Value in US dollars of ${amount:,.0f} invested at the end of {start_label}. The dashed line is the '
+               'amount that keeps the purchasing power of the initial investment: a portfolio above it has grown in '
+               'real terms.')
+    show_data(values.round(2), file_name='purchasing_power.csv')
+
+    st.subheader('Inflation over the previous twelve months')
+    bounds_pct = st.slider('Thresholds of the inflation regimes (%)', 0.0, 6.0, (1.0, 3.0), 0.5, format='%.1f%%',
+                           key='inflation_bounds', bind='query-params',
+                           help='A month is in the low regime if inflation over the previous twelve months is at '
+                                'or below the lower threshold, and in the high regime if it is above the upper one. '
+                                'The notebook uses 1% and 3%.')
+    lo, hi = bounds_pct[0] / 100, bounds_pct[1] / 100
+    if hi <= lo:
+        st.info('Choose a lower threshold below the upper threshold.', icon=':material/tune:')
+        with brief:
+            st.markdown('#### In brief')
+            st.markdown(f'US consumer prices rose by {pct(price_rise, 1)} from {start_label} to {end_label}.')
+        return
+    regime_table, regime = an.inflation_regimes(real_p, results_real, inflation_12m_p, (lo, hi), bench)
+    labels = list(regime_table.columns)
+    months = regime_table.loc['Months']
+
+    y_min = min(float(inflation_12m_p.min()), lo) - 0.01
+    y_max = max(float(inflation_12m_p.max()), hi) + 0.01
+    bands = pd.DataFrame({'y': [y_min, hi], 'y2': [lo, y_max], 'Colour': [P['sleeves'][1], P['sleeves'][2]],
+                          'Label': [f'Low inflation ({threshold(lo)} or less)',
+                                    f'High inflation (above {threshold(hi)})'],
+                          'Middle': [(y_min + lo) / 2, (hi + y_max) / 2]})
+    band_rects = alt.Chart(bands).mark_rect(opacity=0.13).encode(y='y:Q', y2='y2:Q',
+                                                                   color=alt.Color('Colour:N', scale=None))
+    band_text = alt.Chart(bands).mark_text(align='left', dx=6, fontSize=11, color=P['muted']).encode(
+        x=alt.value(0), y='Middle:Q', text='Label:N')
+    st.altair_chart(time_chart(inflation_12m_p.to_frame('Inflation over the previous 12 months'), '.1%',
+                               'Inflation, previous 12 months', 'infl', [P['ink']], under=[band_rects, band_text],
+                               height=260, y_domain=[y_min, y_max], legend=False),
+                    alt='US consumer-price inflation over the previous twelve months, with the low and high '
+                        'inflation regimes shaded')
+    st.caption('Change in US consumer prices (CPI-U) over the twelve months to each month-end. The shaded bands are '
+               'the low and high inflation regimes, coloured as the deflation and inflation seasons of the four-'
+               'seasons graphic.')
+
+    st.subheader('Real returns by inflation regime')
+    shown = [k for k in labels if months[k] > 0]
+    rows = [n for n in regime_table.index if n not in ('Months', 'Average 12-month inflation')]
+    heading = {k: f'{k.split(" (")[0]} · {int(months[k])} months' for k in shown}
+    heat = regime_table.loc[rows, shown].rename(columns=heading).rename_axis('Series').reset_index().melt(
+        'Series', var_name='Regime', value_name='Real return')
+    lim = float(min(0.25, heat['Real return'].abs().max()))
+    base = alt.Chart(heat).encode(
+        x=alt.X('Regime:N', sort=list(heading.values()), title='Inflation over the previous twelve months',
+                axis=alt.Axis(orient='top', labelAngle=0, labelLimit=240, labelOverlap=False,
+                              titleFontWeight='normal', titleColor=P['muted'])),
+        y=alt.Y('Series:N', sort=rows, title=None, axis=alt.Axis(labelLimit=220)))
+    rects = base.mark_rect(cornerRadius=3).encode(
+        color=alt.Color('Real return:Q', scale=alt.Scale(domain=[-lim, 0, lim], range=[P['neg'], P['mid'], P['pos']],
+                                                         clamp=True, interpolate='lab'),
+                        legend=alt.Legend(title='Real return', format='.0%', orient='right')),
+        tooltip=['Series', 'Regime', alt.Tooltip('Real return:Q', format='.1%')])
+    text = base.mark_text(fontSize=12, color=P['ink']).encode(text=alt.Text('Real return:Q', format='.1%'))
+    st.altair_chart((rects + text).properties(height=36 * len(rows) + 50),
+                    alt='Annualized real return of each sleeve and portfolio in months of low, moderate and high '
+                        'inflation')
+    avg = regime_table.loc['Average 12-month inflation']
+    st.caption(f'Annualized compound return after inflation over the months of each regime, which need not be '
+               f'consecutive. Inflation over the previous twelve months: low {threshold(lo)} or less, moderate '
+               f'{threshold(lo)} to {threshold(hi)}, high above {threshold(hi)}; its average in each regime: '
+               + '; '.join(f'{k.split(" (")[0].lower()} {pct(avg[k])}' for k in shown) + '.'
+               + (' No month of the chosen period falls in the '
+                  + ' or '.join(k.split(' (')[0].lower() for k in labels if months[k] == 0) + ' regime.'
+                  if len(shown) < len(labels) else ''))
+    show_data(regime_table, 'Show the regime table', file_name='inflation_regimes.csv')
+
+    # Calendar years: inflation from December to December and the real return of each sleeve
+    cal = an.calendar_real_returns(real_p, results_real, inflation_p, bench)
+    counts = real_p.groupby(real_p.index.year).size()
+    full = [y for y in cal.index if counts[y] == 12]
+
+    # The plain-language summary, written from the numbers above
+    notes = [f"US consumer prices rose by **{pct(price_rise, 1)}** from {start_label} to {end_label}, "
+             f"{pct(inflation_rate)} a year: ${amount:,.0f} at the end buys what ${amount / (1 + price_rise):,.0f} "
+             f"bought at the start. After inflation, the Permanent Portfolio grew by "
+             f"**{pct(r_pp['Compound annual return'])}** a year, against {pct(r_b['Compound annual return'])} for "
+             f"the {bench}."]
+    high, low_k = labels[2], labels[0]
+    if months[high] > 0:
+        t = regime_table[high]
+        positive = [s for s in SLEEVES if t[s] > 0]
+        best = t[SLEEVES].idxmax()
+        lead = (f"{SHORT[positive[0]].capitalize()} was the only sleeve with a positive real return "
+                f"({pct(t[positive[0]], 1)} a year)" if len(positive) == 1 else
+                f"The best sleeve was {SHORT[best]} ({pct(t[best], 1)} a year)")
+        notes.append(f"In the {int(months[high])} months in which inflation over the previous year exceeded "
+                     f"{threshold(hi)}, the Permanent Portfolio returned **{pct(t[PP], 1)}** a year after inflation, "
+                     f"against {pct(t[bench], 1)} for the {bench}. {lead}.")
+    if months[low_k] > 0:
+        t = regime_table[low_k]
+        best = t[SLEEVES].idxmax()
+        tlt = '' if best == 'Long-term Treasuries (TLT)' else \
+            f", while long-term Treasuries returned {pct(t['Long-term Treasuries (TLT)'], 1)}"
+        notes.append(f"In the {int(months[low_k])} months with inflation of {threshold(lo)} or less, the best sleeve "
+                     f"was {SHORT[best]} ({pct(t[best], 1)} a year after inflation){tlt}.")
+    if len(full) >= 2:
+        top = sorted(cal.loc[full, 'Inflation'].nlargest(2).index)
+        two = (1 + cal.loc[top]).prod() - 1
+        notes.append(f"In {top[0]} and {top[1]}, the two calendar years with the highest inflation "
+                     f"({pct(cal.loc[top[0], 'Inflation'], 1)} and {pct(cal.loc[top[1], 'Inflation'], 1)}), the "
+                     f"Permanent Portfolio lost {pct(-two[PP], 1)} of its purchasing power over the two years, against "
+                     f"{pct(-two[bench], 1)} for the {bench}; gold returned {pct(two['Gold (GLD)'], 1)} and long-term "
+                     f"Treasuries {pct(two['Long-term Treasuries (TLT)'], 1)} after inflation."
+                     if two[PP] < 0 and two[bench] < 0 else
+                     f"In {top[0]} and {top[1]}, the two calendar years with the highest inflation, the Permanent "
+                     f"Portfolio returned {pct(two[PP], 1)} after inflation over the two years, against "
+                     f"{pct(two[bench], 1)} for the {bench}.")
+    bills = regime_table.loc['Treasury bills', shown]
+    if (bills < 0).all():
+        notes.append('Treasury bills lost purchasing power in every inflation regime.')
+    with brief:
+        st.markdown('#### In brief')
+        st.markdown('\n'.join(f'- {s}' for s in notes))
+        st.caption(f'Inflation regimes: {threshold(lo)} and {threshold(hi)} over the previous twelve months. '
+                   'Section 16 of the notebook discusses these results; Erb and Harvey (2013) find that gold has been '
+                   'an unreliable inflation hedge over the horizons that matter to most investors.')
+
+    if len(full) >= 3:
+        st.subheader('Each calendar year: inflation and the real return')
+        names = SLEEVES + [PP]
+        source_col = {'Equities (VTI)': VTI}
+        corr = {s: cal.loc[full, 'Inflation'].corr(cal.loc[full, source_col.get(s, s)]) for s in names}
+        panels = {s: f'{s.split(" (")[0]} · r = {corr[s]:.2f}' for s in names}
+        dots = pd.concat([pd.DataFrame({'Year': [str(y) for y in full], 'Series': s, 'Panel': panels[s],
+                                        'Inflation': cal.loc[full, 'Inflation'].values,
+                                        'Real return': cal.loc[full, source_col.get(s, s)].values}) for s in names])
+        point = alt.Chart().mark_point(filled=True, size=55, opacity=0.9).encode(
+            x=alt.X('Inflation:Q', axis=alt.Axis(format='.0%', tickCount=4), title='Inflation that year'),
+            y=alt.Y('Real return:Q', axis=alt.Axis(format='.0%'), title='Real return that year'),
+            color=alt.Color('Series:N', scale=alt.Scale(domain=names, range=P['sleeves'] + [P['series'][0]]),
+                            legend=None),
+            tooltip=['Year', 'Series', alt.Tooltip('Inflation:Q', format='.1%'),
+                     alt.Tooltip('Real return:Q', format='.1%')])
+        fit = alt.Chart().transform_regression('Inflation', 'Real return').mark_line(
+            color=P['muted'], strokeDash=[5, 4]).encode(x='Inflation:Q', y='Real return:Q')
+        zero = alt.Chart().mark_rule(color=P['soft']).encode(y=alt.datum(0))
+        grid = alt.layer(zero, fit, point, data=dots).properties(width=220, height=170).facet(
+            facet=alt.Facet('Panel:N', sort=[panels[s] for s in names], title=None,
+                            header=alt.Header(labelFontSize=12, labelLimit=240)), columns=3)
+        st.altair_chart(grid, alt='Calendar-year real return of each sleeve and of the Permanent Portfolio against '
+                                  'the inflation of the same year')
+        st.caption(f'Each dot is a full calendar year ({full[0]}–{full[-1]}): inflation from December to December on '
+                   'the horizontal axis and the return after inflation on the vertical axis; the dashed line is a '
+                   'least-squares fit and r the correlation between the two. A downward slope means the asset lost '
+                   'purchasing power in years of higher inflation.')
+        show_data(cal, 'Show calendar-year inflation and real returns', file_name='calendar_real_returns.csv')
 
 
 def section_method():
@@ -777,36 +1023,57 @@ def section_method():
             'the three-month Treasury-bill rate (FRED, TB3MS), divided by 12 and lagged one month, which is also '
             'the risk-free rate. The benchmark is a constant mix of VTI and US aggregate bonds (AGG), rebalanced '
             'monthly. Means are annualized by multiplying by 12 and volatilities by √12.\n\n'
+            'With *Real* selected at the top of the page, every monthly return, Treasury bills included, is '
+            'deflated by US consumer-price inflation, (1 + r) / (1 + π) − 1, where π is the monthly change in the '
+            'consumer price index for all urban consumers before seasonal adjustment (FRED, CPIAUCNS), and the '
+            'same functions are applied to the deflated returns, as in Section 16 of the notebook. Deflation leaves '
+            'every rebalancing decision unchanged, values are expressed at the prices of the month in which the '
+            'money is invested, and the Sharpe ratio and alpha are measured against the real return of Treasury '
+            'bills. The index for October 2025, which the Bureau of Labor Statistics did not publish because prices '
+            'were not collected during the federal shutdown, is the geometric mean of September and November.\n\n'
             'The assumptions in the sidebar are passed to the same functions the notebook uses. Changing the '
             'period restarts the strategy from equal weights in the first month chosen, which differs from the '
             'sub-period estimates in Section 15 of the notebook, where the full-sample backtest is evaluated '
             'over shorter windows. The overview sentences, the sleeve leaders and the crisis panels present '
-            'results the notebook reports in its tables.')
+            'results the notebook reports in its tables, and the Inflation tab presents the analysis of Section 16 '
+            'for the chosen period and inflation thresholds.')
 
         st.subheader('Consistency with the notebook')
-        res_d, _, _ = an.simulate(rets)
-        table_d, _ = an.performance_tables(res_d)
-        reference = notebook_table1()
-        gap = (table_d - reference).abs().max().max()
-        if gap < 5e-5:
-            st.success(f'With the notebook\'s assumptions the app reproduces Table 1 of the notebook to four '
-                       f'decimals (largest difference across the {reference.notna().sum().sum()} reported values: '
-                       f'{gap:.1e}).', icon=':material/verified:')
-        else:
-            st.error(f'The app differs from Table 1 of the notebook by up to {gap:.2e}.', icon=':material/error:')
-        st.caption('Checked on every load against notebook/outputs/table1_performance.csv. The automated tests in '
-                   'the repository also verify that the functions in core.py are identical to the notebook\'s.')
-        show_data((table_d - reference), 'Show the differences', file_name='consistency_check.csv')
+        checks = []
+        for label, panel, saved_name in (('Table 1', rets, 'table1_performance.csv'),
+                                         ('the real-terms Table 1 of Section 16', real_rets, 'table1_real_terms.csv')):
+            res_d, _, _ = an.simulate(panel)
+            table_d, _ = an.performance_tables(res_d)
+            reference = notebook_table(saved_name)
+            checks.append((label, table_d - reference, reference.notna().sum().sum()))
+        for label, diff, n_values in checks:
+            gap = diff.abs().max().max()
+            if gap < 5e-5:
+                st.success(f'With the notebook\'s assumptions the app reproduces {label} of the notebook to four '
+                           f'decimals (largest difference across the {n_values} reported values: {gap:.1e}).',
+                           icon=':material/verified:')
+            else:
+                st.error(f'The app differs from {label} of the notebook by up to {gap:.2e}.', icon=':material/error:')
+        st.caption('Checked on every load against notebook/outputs/table1_performance.csv and '
+                   'table1_real_terms.csv. The automated tests in the repository also verify that the functions in '
+                   'core.py are identical to the notebook\'s.')
+        show_data(checks[0][1], 'Show the differences', file_name='consistency_check.csv')
     with right:
         st.subheader('Data')
         st.table(pd.DataFrame({
-            'Series': ['VTI, TLT, GLD, AGG', 'TB3MS'],
-            'Source': ['Yahoo Finance (yfinance)', 'FRED, St. Louis Fed'],
-            'Months': [f'{month_label(MONTHS[0])} to {month_label(MONTHS[-1])}'] * 2,
-            'Observations': [len(rets)] * 2}).set_index('Series'), alt='Data sources')
-        st.caption('Live data are downloaded once per server session. If either source does not respond, the app '
-                   'uses the returns saved by the notebook\'s own run, and says so at the top of the page.')
+            'Series': ['VTI, TLT, GLD, AGG', 'TB3MS', 'CPIAUCNS (CPI-U)'],
+            'Source': ['Yahoo Finance (yfinance)', 'FRED, St. Louis Fed', 'FRED (Bureau of Labor Statistics)'],
+            'Months': [f'{month_label(MONTHS[0])} to {month_label(MONTHS[-1])}'] * 2
+                      + [f'{cpi.index[0]:%b %Y} to {cpi.index[-1]:%b %Y}'],
+            'Observations': [len(rets)] * 2 + [len(cpi)]}).set_index('Series'), alt='Data sources')
+        st.caption('Returns cover the months of the sample; the price index starts twelve months earlier, so that '
+                   'inflation over the previous twelve months is defined from the first month. Live data are '
+                   'downloaded once per server session. If a source does not respond, the app uses the data saved '
+                   'by the notebook\'s own run, and says so at the top of the page.')
         show_data(rets_p, 'Show the monthly returns', file_name='monthly_returns.csv')
+        show_data(pd.DataFrame({'CPI': cpi, 'Monthly inflation': cpi.pct_change(fill_method=None),
+                                '12-month inflation': cpi.pct_change(12, fill_method=None)}),
+                  'Show the consumer price index', file_name='consumer_prices.csv')
         show_data(results, 'Show the simulation results', file_name='simulation_results.csv')
 
         if 'OWNER/REPO' not in REPO_URL:
@@ -825,12 +1092,12 @@ def section_method():
 
 if view == 'Client':
     sections = {'Overview': section_overview, 'Crises': section_crises, 'Four seasons': section_regimes,
-                'Method and data': section_method}
+                'Inflation': section_inflation, 'Method and data': section_method}
 else:
     sections = {'Overview': section_overview, 'Performance': section_performance, 'Risk': section_risk,
                 'Rebalancing and costs': section_rebalancing, 'Crises': section_crises,
                 'Rebalancing rules': section_rules, 'Calendar years': section_calendar,
-                'Four seasons': section_regimes, 'Method and data': section_method}
+                'Four seasons': section_regimes, 'Inflation': section_inflation, 'Method and data': section_method}
 tabs = st.tabs(list(sections), key=f'tab_{view.lower()}', bind='query-params')
 for tab, render in zip(tabs, sections.values()):
     with tab:
