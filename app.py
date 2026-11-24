@@ -604,6 +604,7 @@ def section_regimes():
                                          'Treasury bills'],
                               'x': [0, 1, 0, 1], 'y': [1, 1, 0, 0]})
         cells['Colour'] = [P['sleeves'][SLEEVES.index(s)] for s in cells['Sleeve']]
+        cells['Label'] = [s.replace('Long-term Treasuries', 'Long-term\nTreasuries') for s in cells['Sleeve']]
         # Positions inside each tile (tiles span 0.96 units; the gap between them is 0.04)
         cells['x2'], cells['y2'] = cells['x'] + 0.96, cells['y'] + 0.96
         cells['mx'], cells['my'] = cells['x'] + 0.14, cells['y'] + 0.76      # colour marker
@@ -620,8 +621,8 @@ def section_regimes():
             **pos('mx', 'my'), color=alt.Color('Colour:N', scale=None))
         season = alt.Chart(cells).mark_text(align='left', fontSize=17, fontWeight='bold', color=P['ink']).encode(
             **pos('tx', 'sy'), text='Season:N')
-        sleeve = alt.Chart(cells).mark_text(align='left', fontSize=11, color=P['muted']).encode(
-            **pos('tx', 'ly'), text='Sleeve:N')
+        sleeve = alt.Chart(cells).mark_text(align='left', baseline='top', lineBreak='\n', fontSize=11,
+                                            color=P['muted']).encode(**pos('tx', 'ly'), text='Label:N')
         st.altair_chart(alt.layer(tiles, marker, season, sleeve).properties(height=330),
                         alt="Browne's four economic seasons and the sleeve meant for each")
         st.caption('Browne (1999) argues that each asset does well in a different economic season, so holding all '
