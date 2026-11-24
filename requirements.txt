@@ -1,0 +1,7 @@
+# Packages imported by app.py, core.py and analysis.py, pinned to the versions tested locally.
+# pandas, numpy and yfinance match the versions of the notebook's Google Colab run.
+streamlit==1.67.0
+altair==6.3.0
+pandas==2.2.3
+numpy==2.4.6
+yfinance==0.2.66

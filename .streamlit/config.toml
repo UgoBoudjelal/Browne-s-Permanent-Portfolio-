@@ -1,0 +1,34 @@
+# Light and dark themes built on a colour-blind-safe chart palette (validated in both modes).
+# Series colours are fixed per portfolio in app.py; the categorical list below covers any other chart.
+
+[theme]
+baseRadius = "6px"
+buttonRadius = "6px"
+showWidgetBorder = true
+showSidebarBorder = true
+headingFontWeights = [650, 600, 600, 600, 600, 600]
+
+[theme.light]
+primaryColor = "#2a78d6"
+backgroundColor = "#fcfcfb"
+secondaryBackgroundColor = "#f3f2ee"
+textColor = "#0b0b0b"
+linkColor = "#1c5cab"
+borderColor = "#e1e0d9"
+chartCategoricalColors = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
+dataframeBorderColor = "#e1e0d9"
+dataframeHeaderBackgroundColor = "#f3f2ee"
+
+[theme.dark]
+primaryColor = "#3987e5"
+backgroundColor = "#1a1a19"
+secondaryBackgroundColor = "#262624"
+textColor = "#f0efec"
+linkColor = "#86b6ef"
+borderColor = "#2c2c2a"
+chartCategoricalColors = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#0ca30c", "#9085e9", "#e66767"]
+dataframeBorderColor = "#2c2c2a"
+dataframeHeaderBackgroundColor = "#262624"
+
+[browser]
+gatherUsageStats = false

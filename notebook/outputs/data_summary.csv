@@ -1,0 +1,6 @@
+Series,Source,First month,Last month,Observations
+VTI,Yahoo Finance,Jan 2005,Oct 2026,262
+TLT,Yahoo Finance,Jan 2005,Oct 2026,262
+GLD,Yahoo Finance,Jan 2005,Oct 2026,262
+AGG,Yahoo Finance,Jan 2005,Oct 2026,262
+TB3MS (Treasury bills),FRED,Jan 2005,Oct 2026,262
