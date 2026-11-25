@@ -1,6 +1,6 @@
 """Functions of the notebook Group_G_Permanent_Portfolio.ipynb, copied without modification.
 
-Every function below is an exact copy of its definition in the notebook (Sections 3 to 9, 14 and 16), so
+Every function below is an exact copy of its definition in the notebook (Sections 3 to 9, 14, 16 and 17), so
 that the Streamlit application computes its results with the same code as the notebook.
 tests/test_consistency.py fails if any copy differs from the notebook by a single character.
 """
@@ -172,3 +172,47 @@ def download_cpi(start, end):
 def real_returns(r, inflation):
     # Returns in real terms, (1 + r) / (1 + inflation) - 1, for every column of r
     return (1 + r).div(1 + inflation, axis=0) - 1
+
+
+def download_eurusd(start, end):
+    # US dollars per euro at each month-end (FRED DEXUSEU: noon buying rates in New York, last business day)
+    last_month = (pd.Timestamp(end) - pd.DateOffset(months=1)).strftime('%Y-%m-%d')
+    url = ('https://fred.stlouisfed.org/graph/fredgraph.csv?id=DEXUSEU&fq=Monthly&fam=eop'
+           f'&cosd={start}&coed={last_month}')
+    eurusd = pd.read_csv(url, index_col=0, parse_dates=True, na_values='.')['DEXUSEU']
+    eurusd = eurusd.reindex(pd.date_range(start, end, freq='MS', inclusive='left'))
+    if eurusd.isna().any():
+        raise ValueError(f"Missing exchange rate in: {list(eurusd.index[eurusd.isna()].strftime('%Y-%m'))}")
+    return eurusd
+
+
+def download_euribor(start, end):
+    # Monthly return on euro deposits (three-month Euribor from the ECB Data Portal), lagged as the T-bill rate
+    last_month = (pd.Timestamp(end) - pd.DateOffset(months=1)).strftime('%Y-%m')
+    url = ('https://data-api.ecb.europa.eu/service/data/FM/M.U2.EUR.RT.MM.EURIBOR3MD_.HSTA?format=csvdata'
+           f'&startPeriod={pd.Timestamp(start):%Y-%m}&endPeriod={last_month}')
+    euribor = pd.read_csv(url, index_col='TIME_PERIOD', parse_dates=True)['OBS_VALUE']
+    euribor = euribor.reindex(pd.date_range(start, end, freq='MS', inclusive='left'))
+    if euribor.isna().any():
+        raise ValueError(f"Missing Euribor rate in: {list(euribor.index[euribor.isna()].strftime('%Y-%m'))}")
+
+    rf_eur = euribor / 100 / 12    # percent per annum (monthly average) -> monthly decimal return
+    rf_eur = rf_eur.shift(1)       # each month earns the rate known at its start
+    return rf_eur
+
+
+def download_hicp(start, end):
+    # Euro-area consumer prices (FRED CP0000EZCCM086NEST: HICP, all items, changing composition), monthly
+    last_month = (pd.Timestamp(end) - pd.DateOffset(months=1)).strftime('%Y-%m-%d')
+    url = ('https://fred.stlouisfed.org/graph/fredgraph.csv?id=CP0000EZCCM086NEST'
+           f'&cosd={start}&coed={last_month}')
+    hicp = pd.read_csv(url, index_col=0, parse_dates=True, na_values='.')['CP0000EZCCM086NEST']
+    hicp = hicp.reindex(pd.date_range(start, end, freq='MS', inclusive='left'))
+    if hicp.isna().any():
+        raise ValueError(f"Missing euro-area price index in: {list(hicp.index[hicp.isna()].strftime('%Y-%m'))}")
+    return hicp
+
+
+def in_euros(r, dollar_return):
+    # Returns of dollar assets measured in euros, (1 + r) * (1 + dollar_return) - 1, for every column of r
+    return (1 + r).mul(1 + dollar_return, axis=0) - 1

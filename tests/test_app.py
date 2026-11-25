@@ -143,3 +143,72 @@ def test_client_view_in_real_terms(client):
     client.segmented_control(key='terms').set_value('Real').run()
     assert not client.exception
     assert any('after inflation' in m.value for m in client.markdown)
+
+
+# Euros (Section 17 of the notebook)
+
+def test_euro_view_reproduces_the_euro_tables(app):
+    app.segmented_control(key='currency').set_value('EUR').run()
+    assert not app.exception
+    for terms, name in (('Nominal', 'table1_euros_formatted.csv'), ('Real', 'table1_euros_real_formatted.csv')):
+        app.segmented_control(key='terms').set_value(terms).run()
+        assert not app.exception
+        shown = performance_table(app).replace('–', '-')
+        expected = pd.read_csv(OUTPUTS / name, index_col=0).fillna('-')
+        assert list(shown.index) == list(expected.index)          # including the growth of one euro
+        assert (shown.values == expected.values).all()
+    assert any(m.label.startswith('Real value of €') for m in app.metric)
+
+
+def test_method_checks_the_euro_tables(app):
+    messages = [s.value for s in app.success]
+    assert len(messages) == 4
+    assert any('Table 1 in euros of Section 17' in m for m in messages)
+    assert any('Table 1 in real euros of Section 17' in m for m in messages)
+
+
+def test_currency_tab_summarizes_the_euro_results(app):
+    table = pd.read_csv(OUTPUTS / 'table1_euros.csv', index_col=0)
+    briefs = [m.value for m in app.markdown if 'Measured in euros, without hedging' in m.value]
+    assert briefs
+    assert any(f"{table.loc['Compound annual return', 'Permanent Portfolio']:.2%}" in b for b in briefs)
+    assert any(f"{table.loc['Maximum drawdown', 'Permanent Portfolio']:.2%}" in b for b in briefs)
+    crises = pd.read_csv(OUTPUTS / 'crisis_returns_euros.csv', index_col=0)
+    rose = int((crises['Dollar against the euro'] > 0).sum())
+    how_many = f'all {len(crises)}' if rose == len(crises) else f'{rose} of the {len(crises)}'
+    assert any(f'rose against the euro in {how_many} equity crises' in b for b in briefs)
+
+
+def test_crises_in_euros_keep_the_dates_of_section_14(app):
+    app.segmented_control(key='currency').set_value('EUR').run()
+    assert not app.exception
+    expected = pd.read_csv(OUTPUTS / 'crisis_returns_euros.csv', index_col=0)
+    table = next(t.value for t in app.table if 'Dollar against the euro' in t.value.columns
+                 and 'Months, peak to trough' in t.value.columns)
+    assert list(table['Equity peak']) == list(expected['Equity peak'])
+    assert list(table['Permanent Portfolio']) == [f'{v:.1%}' for v in expected['Permanent Portfolio']]
+
+
+@pytest.mark.parametrize('terms', ['Nominal', 'Real'])
+@pytest.mark.parametrize('rule', ['Tolerance band', 'Calendar reset', 'Buy and hold'])
+def test_every_rule_runs_in_euros(app, rule, terms):
+    app.segmented_control(key='currency').set_value('EUR')
+    app.segmented_control(key='terms').set_value(terms)
+    app.segmented_control(key='rule').set_value(rule)
+    app.run()
+    assert not app.exception
+
+
+def test_inflation_tab_in_euros_uses_euro_area_prices(app):
+    app.segmented_control(key='currency').set_value('EUR').run()
+    assert not app.exception
+    assert any('Euro-area consumer prices rose by' in m.value for m in app.markdown)
+    app.select_slider(key='period').set_value(('2016-01', '2026-10')).run()
+    assert not app.exception
+
+
+def test_client_view_in_euros(client):
+    client.segmented_control(key='currency').set_value('EUR').run()
+    assert not client.exception
+    assert any('€' in m.value and 'In brief' not in m.value for m in client.markdown)
+    assert any(m.label.startswith('Value of €') for m in client.metric)

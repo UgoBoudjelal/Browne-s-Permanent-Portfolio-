@@ -5,6 +5,7 @@
    starting from the same monthly returns (notebook/outputs/returns_monthly.csv).
 3. The engine passes the notebook's Validations 1, 2 and 11.
 4. Section 16 (inflation and real returns) is reproduced from the saved returns and consumer price index.
+5. Section 17 (the euro-based investor) is reproduced from the saved returns, exchange rates, Euribor and HICP.
 """
 import ast
 import json
@@ -61,6 +62,24 @@ def real(rets, cpi):
     real_rets = core.real_returns(rets, inflation)
     real_results, _, _ = analysis.simulate(real_rets)
     return real_rets, real_results, inflation, inflation_12m
+
+
+@pytest.fixture(scope='module')
+def euro(rets):
+    # Section 17: the panel in euros and the simulation repeated on it, nominal and after euro-area inflation
+    data = pd.read_csv(OUTPUTS / 'euro_data.csv', index_col=0, parse_dates=True)
+    dollar_return = analysis.dollar_returns(data['Dollars per euro'].dropna(), rets.index)
+    rf_eur = data.loc[rets.index, 'Euribor return']
+    inflation_eur, _ = analysis.inflation_rates(data['HICP'], rets.index)
+    euro_rets = core.in_euros(rets, dollar_return)
+    euro_results, _, _ = analysis.simulate(euro_rets, rf=rf_eur)
+    euro_real_results, _, _ = analysis.simulate(core.real_returns(euro_rets, inflation_eur),
+                                                rf=core.real_returns(rf_eur, inflation_eur))
+    return {'data': data, 'dollar_return': dollar_return, 'rf_eur': rf_eur, 'euro_rets': euro_rets,
+            'results': euro_results, 'real_results': euro_real_results}
+
+
+EURO_ROW = {'Growth of $1': 'Growth of €1'}       # Section 17 labels the last row of its tables in euros
 
 
 @pytest.fixture(scope='module')
@@ -240,3 +259,125 @@ def test_download_cpi_fills_only_october_2025(monkeypatch):
     monkeypatch.setattr(core.pd, 'read_csv', lambda *args, **kwargs: gappy.copy())
     with pytest.raises(ValueError, match='2025-08'):
         core.download_cpi('2025-07-01', '2026-01-01')
+
+
+# 5. Section 17: the perspective of a euro-based investor
+
+def test_section_17_parameters_match_the_notebook():
+    sources = [''.join(c['source']) for c in json.loads(NOTEBOOK.read_text(encoding='utf-8'))['cells']
+               if c['cell_type'] == 'code']
+    assert any('eurusd = download_eurusd(start, end)' in s for s in sources)
+    assert any('rf_eur = download_euribor(start, end).loc[rets.index]' in s for s in sources)
+    assert any(f"hicp = download_hicp('{analysis.HICP_START}', end)" in s for s in sources)
+
+
+def test_saved_euro_data(rets, euro):
+    data = euro['data']
+    assert data.index[0] == pd.Timestamp(analysis.HICP_START) and not data['HICP'].isna().any()
+    assert data['Dollars per euro'].first_valid_index() == pd.Timestamp(analysis.START)
+    assert not data.loc[analysis.START:, 'Dollars per euro'].isna().any()
+    assert not euro['rf_eur'].isna().any()
+    assert np.allclose(euro['dollar_return'], data.loc[rets.index, 'Dollar return in euros'], rtol=0, atol=TOL)
+    inflation_eur, inflation_eur_12m = analysis.inflation_rates(data['HICP'], rets.index)
+    assert np.allclose(inflation_eur, data.loc[rets.index, 'Monthly euro-area inflation'], rtol=0, atol=TOL)
+    assert np.allclose(inflation_eur_12m, data.loc[rets.index, '12-month euro-area inflation'], rtol=0, atol=TOL)
+
+
+def test_validation_12_conversion_leaves_rebalancing_unchanged(model, euro):
+    results = model[0]
+    for run in (euro['results'], euro['real_results']):
+        assert np.max(np.abs(run['turnover'] - results['turnover'])) < 1e-12
+    converted = (1 + results['pp']) * (1 + euro['dollar_return']) - 1
+    assert np.max(np.abs(euro['results']['pp'] - converted)) < 1e-12
+
+
+def test_euro_returns_panel(euro):
+    theirs = pd.read_csv(OUTPUTS / 'euro_returns_monthly.csv', index_col=0, parse_dates=True)
+    assert_same(euro['euro_rets'], theirs)
+
+
+def test_euro_results_monthly(euro):
+    for key, name in (('results', 'euro_results_monthly.csv'), ('real_results', 'euro_real_results_monthly.csv')):
+        theirs = pd.read_csv(OUTPUTS / name, index_col=0, parse_dates=True)
+        assert_same(euro[key], theirs)
+
+
+def test_table1_in_euros(euro):
+    for key, name in (('results', 'table1_euros'), ('real_results', 'table1_euros_real')):
+        table, _ = analysis.performance_tables(euro[key])
+        table = table.rename(index=EURO_ROW)
+        assert_same(table, saved(f'{name}.csv'))
+        theirs = saved(f'{name}_formatted.csv').fillna('-')
+        assert (core.format_table(table) == theirs).all().all()
+
+
+def test_perspective_table(model, real, euro):
+    tables = {'Dollars': analysis.performance_tables(model[0])[0],
+              'Dollars, real': analysis.performance_tables(real[1])[0],
+              'Euros': analysis.performance_tables(euro['results'])[0].rename(index=EURO_ROW),
+              'Euros, real': analysis.performance_tables(euro['real_results'])[0].rename(index=EURO_ROW)}
+    theirs = pd.read_csv(OUTPUTS / 'perspectives.csv', index_col=0, header=[0, 1])
+    assert_same(analysis.perspective_table(tables), theirs)
+
+
+def test_currency_effects(rets, model, euro):
+    ours = analysis.currency_effects(rets, model[0], euro['euro_rets'], euro['results'], euro['dollar_return'])
+    assert_same(ours, saved('currency_effects.csv'))
+
+
+def test_crises_in_euros(model, euro):
+    crisis_table, recovery_table = analysis.crisis_analysis(model[0])
+    ours, ours_recovery = analysis.crises_on_dates(euro['results'], crisis_table,
+                                                   dollar_return=euro['dollar_return'])
+    assert_same(ours, saved('crisis_returns_euros.csv'))
+    assert_same(ours_recovery, saved('crisis_recovery_months_euros.csv'))
+    # In dollars, the same calculation reproduces Section 14
+    same, same_recovery = analysis.crises_on_dates(model[0], crisis_table)
+    assert_same(same, crisis_table)
+    assert_same(same_recovery, recovery_table)
+
+
+def test_calendar_euro_returns(euro):
+    ours = analysis.calendar_euro_returns(euro['euro_rets'], euro['results'], euro['dollar_return'], euro['rf_eur'])
+    assert_same(ours, saved('calendar_euro_returns.csv'))
+
+
+def test_in_euros_multiplies_by_the_change_in_the_dollar():
+    r = pd.DataFrame({'a': [0.10, -0.05]})
+    e = pd.Series([0.02, -0.01])
+    expected = pd.DataFrame({'a': [1.10 * 1.02 - 1, 0.95 * 0.99 - 1]})
+    pd.testing.assert_frame_equal(core.in_euros(r, e), expected)
+
+
+def test_download_eurusd_requires_every_month(monkeypatch):
+    # FRED's response replaced by a month-end series (no network access)
+    months = pd.date_range('2025-01-01', '2025-05-01', freq='MS', inclusive='left')
+    fred = pd.DataFrame({'DEXUSEU': [1.04, 1.04, 1.08, 1.13]}, index=months)
+    monkeypatch.setattr(core.pd, 'read_csv', lambda *args, **kwargs: fred.copy())
+    assert list(core.download_eurusd('2025-01-01', '2025-05-01')) == [1.04, 1.04, 1.08, 1.13]
+    gappy = fred.copy()
+    gappy.iloc[2, 0] = np.nan
+    monkeypatch.setattr(core.pd, 'read_csv', lambda *args, **kwargs: gappy.copy())
+    with pytest.raises(ValueError, match='2025-03'):
+        core.download_eurusd('2025-01-01', '2025-05-01')
+
+
+def test_download_euribor_converts_and_lags(monkeypatch):
+    # The ECB's response replaced by three monthly averages in percent per annum
+    months = pd.date_range('2025-01-01', '2025-04-01', freq='MS', inclusive='left')
+    ecb = pd.DataFrame({'OBS_VALUE': [2.4, 2.4, 1.2]}, index=pd.Index(months, name='TIME_PERIOD'))
+    monkeypatch.setattr(core.pd, 'read_csv', lambda *args, **kwargs: ecb.copy())
+    rf_eur = core.download_euribor('2025-01-01', '2025-04-01')
+    assert np.isnan(rf_eur.iloc[0])
+    assert rf_eur.iloc[1:].tolist() == pytest.approx([0.002, 0.002])     # the previous month's rate / 100 / 12
+    monkeypatch.setattr(core.pd, 'read_csv', lambda *args, **kwargs: ecb.iloc[:2].copy())
+    with pytest.raises(ValueError, match='2025-03'):
+        core.download_euribor('2025-01-01', '2025-04-01')
+
+
+def test_download_hicp_requires_every_month(monkeypatch):
+    months = pd.date_range('2025-01-01', '2025-04-01', freq='MS', inclusive='left')
+    fred = pd.DataFrame({'CP0000EZCCM086NEST': [100.0, np.nan, 100.6]}, index=months)
+    monkeypatch.setattr(core.pd, 'read_csv', lambda *args, **kwargs: fred.copy())
+    with pytest.raises(ValueError, match='2025-02'):
+        core.download_hicp('2025-01-01', '2025-04-01')

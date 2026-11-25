@@ -1,9 +1,10 @@
 """Calculations of the notebook's result cells, written as functions of the model parameters.
 
 core.py holds exact copies of the notebook's functions. This module repeats the code of the cells that
-use them (Sections 7, 8, 10 and 13 to 16), with the parameters of Section 2 as arguments, so that the
+use them (Sections 7, 8, 10 and 13 to 17), with the parameters of Section 2 as arguments, so that the
 application can re-run the analysis under the assumptions chosen by the user. In real terms, the application
-passes the return panel deflated by core.real_returns to the same functions, as Section 16 does.
+passes the return panel deflated by core.real_returns to the same functions, as Section 16 does; in euros, the
+panel converted by core.in_euros and the Euribor rate as the risk-free rate, as Section 17 does.
 tests/test_consistency.py checks that, at the notebook's settings, every function reproduces the tables the
 notebook saved in notebook/outputs/.
 """
@@ -23,6 +24,7 @@ COST, COST_STRESS = 0.0005, 0.005
 PERIODS = 12
 CPI_START = '2004-01-01'            # Section 16: the price index from twelve months before the first return
 INFLATION_BOUNDS = (0.01, 0.03)     # Section 16: thresholds of the low, moderate and high inflation regimes
+HICP_START = '2004-01-01'           # Section 17: the euro-area price index from the same month as the CPI
 
 SLEEVES = ['Equities', 'Long-term Treasuries', 'Gold', 'Treasury bills']
 REVIEW_SCHEDULES = {'Monthly': list(range(1, 13)), 'Quarterly': [3, 6, 9, 12],
@@ -45,8 +47,9 @@ def bench_name(w_stocks_bench):
 
 
 def simulate(rets, band_low=BAND_LOW, band_high=BAND_HIGH, check_months=CHECK_MONTHS,
-             cost=COST, cost_stress=COST_STRESS, w_stocks_bench=W_STOCKS_BENCH):
-    # Sections 7 and 8: strategy before and after costs, benchmark before and after costs
+             cost=COST, cost_stress=COST_STRESS, w_stocks_bench=W_STOCKS_BENCH, rf=None):
+    # Sections 7 and 8: strategy before and after costs, benchmark before and after costs. The risk-free rate
+    # of the performance measures is the T-bill return of the panel, or rf if given (Euribor in Section 17).
     pp_assets = rets[['VTI', 'TLT', 'GLD', 'rf']]          # ordered as TARGET_W
     pp_rets, pp_turnover, pp_weights = backtest(pp_assets, TARGET_W, band_low, band_high, check_months)
 
@@ -54,7 +57,7 @@ def simulate(rets, band_low=BAND_LOW, band_high=BAND_HIGH, check_months=CHECK_MO
     results['pp'] = pp_rets
     results['bench_6040'] = w_stocks_bench * rets['VTI'] + (1 - w_stocks_bench) * rets['AGG']
     results['stocks'] = rets['VTI']
-    results['rf'] = rets['rf']
+    results['rf'] = rets['rf'] if rf is None else rf
     results['turnover'] = pp_turnover
     results['pp_net'] = results['pp'] - results['turnover'] * cost
     results['pp_net_stress'] = results['pp'] - results['turnover'] * cost_stress
@@ -244,4 +247,74 @@ def calendar_real_returns(real_rets, real_results, inflation, bench='60/40'):
         'Long-term Treasuries (TLT)': real_rets['TLT'],
         'Gold (GLD)': real_rets['GLD'],
         'Treasury bills': real_rets['rf'],
+    }))
+
+
+def dollar_returns(eurusd, index):
+    # Section 17: return in euros of holding one dollar, from the dollars per euro at each month-end
+    return (eurusd.shift(1) / eurusd - 1).loc[index]
+
+
+def perspective_table(tables, bench='60/40'):
+    # Section 17: the main measures of the strategy and the benchmark in each currency, nominal and real;
+    # tables maps 'Dollars', 'Dollars, real', 'Euros' and 'Euros, real' to the corresponding Table 1
+    summary_rows = ['Compound annual return', 'Annualized volatility', 'Sharpe ratio', 'Maximum drawdown',
+                    'Annualized alpha', 'Alpha t-statistic']
+    return pd.concat({p: pd.DataFrame({k: tables[k][p] for k in tables}).loc[summary_rows]
+                      for p in ['Permanent Portfolio', bench]}, axis=1)
+
+
+def currency_effects(rets, results, euro_rets, euro_results, dollar_return, bench='60/40'):
+    # Section 17: each series in dollars and in euros, and the correlation of its dollar return with the
+    # dollar's return in euros
+    usd_series = pd.DataFrame({'Equities (VTI)': rets['VTI'], 'Long-term Treasuries (TLT)': rets['TLT'],
+                               'Gold (GLD)': rets['GLD'], 'Treasury bills': rets['rf'],
+                               'Aggregate bonds (AGG)': rets['AGG'], 'Permanent Portfolio': results['pp_net'],
+                               bench: results['bench_6040']})
+    eur_series = pd.DataFrame({'Equities (VTI)': euro_rets['VTI'], 'Long-term Treasuries (TLT)': euro_rets['TLT'],
+                               'Gold (GLD)': euro_rets['GLD'], 'Treasury bills': euro_rets['rf'],
+                               'Aggregate bonds (AGG)': euro_rets['AGG'],
+                               'Permanent Portfolio': euro_results['pp_net'], bench: euro_results['bench_6040']})
+    return pd.DataFrame({
+        'Compound annual return in dollars': (1 + usd_series).prod() ** (PERIODS / len(rets)) - 1,
+        'Compound annual return in euros': (1 + eur_series).prod() ** (PERIODS / len(rets)) - 1,
+        'Volatility in dollars': usd_series.std() * np.sqrt(PERIODS),
+        'Volatility in euros': eur_series.std() * np.sqrt(PERIODS),
+        'Correlation with the dollar': usd_series.corrwith(dollar_return),
+    })
+
+
+def crises_on_dates(results, crisis_table, bench='60/40', dollar_return=None):
+    # Section 17: the episodes of Section 14, with the same peak and trough dates, measured with other returns
+    # (in euros, or after inflation in the application); with dollar_return, also the dollar against the euro
+    wealth = pd.DataFrame({'Permanent Portfolio': wealth_index(results['pp_net']),
+                           bench: wealth_index(results['bench_6040']),
+                           'All equity (VTI)': wealth_index(results['stocks'])})
+    peaks = pd.to_datetime(crisis_table['Equity peak'], format='%b %Y')
+    troughs = pd.to_datetime(crisis_table['Equity trough'], format='%b %Y')
+
+    table = crisis_table[['Equity peak', 'Equity trough', 'Months, peak to trough']].copy()
+    recovery_table = pd.DataFrame(index=crisis_table.index)
+    for p in wealth:
+        w = wealth[p]
+        table[p] = [w.loc[t] / w.loc[k] - 1 for k, t in zip(peaks, troughs)]
+        recovery_table[p] = [months_to_recover(w, k, t) for k, t in zip(peaks, troughs)]
+    if dollar_return is not None:
+        dollar_value = wealth_index(dollar_return)
+        table['Dollar against the euro'] = [dollar_value.loc[t] / dollar_value.loc[k] - 1
+                                            for k, t in zip(peaks, troughs)]
+    return table, recovery_table
+
+
+def calendar_euro_returns(euro_rets, euro_results, dollar_return, rf_eur, bench='60/40'):
+    # Section 17: calendar-year returns in euros and the return of the dollar against the euro
+    return calendar_returns(pd.DataFrame({
+        'Dollar against the euro': dollar_return,
+        'Permanent Portfolio': euro_results['pp_net'],
+        bench: euro_results['bench_6040'],
+        'All equity (VTI)': euro_rets['VTI'],
+        'Long-term Treasuries (TLT)': euro_rets['TLT'],
+        'Gold (GLD)': euro_rets['GLD'],
+        'Treasury bills': euro_rets['rf'],
+        'Euribor': rf_eur,
     }))

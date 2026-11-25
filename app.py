@@ -2,18 +2,25 @@
 
 Run locally with `streamlit run app.py`. Every number is computed with core.py (exact copies of the
 notebook's functions) and analysis.py (the notebook's result cells as functions of the assumptions);
-tests/ verifies that the default settings reproduce the notebook's tables, in nominal and in real terms.
+tests/ verifies that the default settings reproduce the notebook's tables, in nominal and in real terms, in
+dollars and in euros.
 """
 import os
 from pathlib import Path
 
 import altair as alt
+import certifi
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 import analysis as an
-from core import download_cpi, format_table, load_data, real_returns
+from core import (download_cpi, download_euribor, download_eurusd, download_hicp, format_table, in_euros, load_data,
+                  real_returns)
+
+# Verify HTTPS downloads against Mozilla's certificate bundle: some systems' own stores (Windows in particular)
+# lack the root certificate of the ECB Data Portal
+os.environ.setdefault('SSL_CERT_FILE', certifi.where())
 
 ROOT = Path(__file__).resolve().parent
 OUTPUTS = ROOT / 'notebook' / 'outputs'
@@ -57,19 +64,26 @@ P = PALETTE['dark' if theme_type == 'dark' else 'light']
 # Data: one download for the whole sample, cached; the notebook's saved returns if the sources are busy
 # ----------------------------------------------------------------------------------------------------------
 
-@st.cache_data(show_spinner='Downloading monthly prices (Yahoo Finance), the T-bill rate and consumer prices '
-                             '(FRED)...')
+EURO_COLUMNS = ['Dollars per euro', 'Euribor return', 'HICP']      # Section 17's data, as saved by the notebook
+
+
+@st.cache_data(show_spinner='Downloading monthly prices (Yahoo Finance), interest rates, consumer prices and exchange '
+                             'rates (FRED and the European Central Bank)...')
 def live_data():
     _, rets = load_data(an.START, an.END, an.TICKERS)
     cpi = download_cpi(an.CPI_START, an.END)
-    return rets, cpi
+    euro = pd.DataFrame({'Dollars per euro': download_eurusd(an.START, an.END),
+                         'Euribor return': download_euribor(an.START, an.END),
+                         'HICP': download_hicp(an.HICP_START, an.END)})
+    return rets, cpi, euro
 
 
 @st.cache_data(show_spinner=False)
 def saved_data():
     rets = pd.read_csv(OUTPUTS / 'returns_monthly.csv', index_col=0, parse_dates=True)
     cpi = pd.read_csv(OUTPUTS / 'consumer_prices.csv', index_col=0, parse_dates=True)['CPI']
-    return rets, cpi
+    euro = pd.read_csv(OUTPUTS / 'euro_data.csv', index_col=0, parse_dates=True)[EURO_COLUMNS]
+    return rets, cpi, euro
 
 
 @st.cache_data(show_spinner=False)
@@ -89,9 +103,9 @@ def get_data():
 
 
 @st.cache_data(show_spinner=False)
-def rule_table(rets_p, cost, w_bench):
-    # Section 15 for the chosen period, cost and benchmark
-    results, _, _ = an.simulate(rets_p, cost=cost, w_stocks_bench=w_bench)
+def rule_table(rets_p, rf_p, cost, w_bench):
+    # Section 15 for the chosen period, cost, benchmark and currency (rf_p: Euribor for the euro investor)
+    results, _, _ = an.simulate(rets_p, cost=cost, w_stocks_bench=w_bench, rf=rf_p)
     return an.rule_comparison(rets_p, results, cost)
 
 
@@ -117,6 +131,16 @@ def table_text(df):
     return df.map(lambda v: '–' if v == '-' else v)
 
 
+def relabel(df):
+    # In euros, the last row of the performance tables is the growth of one euro (as in Section 17)
+    return df.rename(index={'Growth of $1': GROWTH_ROW})
+
+
+def money(x):
+    # An amount in the currency of the page, e.g. $10,000 or €10,000
+    return f'{"-" if x < 0 else ""}{SYM}{abs(x):,.0f}'
+
+
 def time_chart(wide, fmt, y_title, key, colors, log=False, under=(), over=(), height=340, y_domain=None, dashed=(),
                legend=True):
     """Lines over time with a hover crosshair; the tooltip lists every series at the hovered month."""
@@ -126,8 +150,12 @@ def time_chart(wide, fmt, y_title, key, colors, log=False, under=(), over=(), he
     safe = data.copy()
     safe.columns = ['Date'] + [f's{i}' for i in range(len(names))]
 
-    color = alt.Color('Series:N', scale=alt.Scale(domain=names, range=colors[:len(names)]),
-                      legend=alt.Legend(title=None, orient='top', direction='horizontal') if legend else None)
+    legend_spec = None
+    if legend:
+        # Line symbols when some series are dashed, so that the legend shows which ones
+        style = dict(symbolType='stroke', symbolSize=400, symbolStrokeWidth=2) if dashed else {}
+        legend_spec = alt.Legend(title=None, orient='top', direction='horizontal', labelLimit=320, **style)
+    color = alt.Color('Series:N', scale=alt.Scale(domain=names, range=colors[:len(names)]), legend=legend_spec)
     if log:
         scale = alt.Scale(type='log')
     elif y_domain is not None:
@@ -140,7 +168,8 @@ def time_chart(wide, fmt, y_title, key, colors, log=False, under=(), over=(), he
 
     encoding = dict(x=x, y=alt.Y('Value:Q', title=y_title, scale=scale, axis=alt.Axis(format=fmt)), color=color)
     if dashed:
-        encoding['strokeDash'] = alt.StrokeDash('Series:N', legend=None, scale=alt.Scale(
+        # Same field and legend as the colour, so that Vega-Lite merges the two into one legend
+        encoding['strokeDash'] = alt.StrokeDash('Series:N', legend=legend_spec, scale=alt.Scale(
             domain=names, range=[[6, 4] if n in dashed else [1, 0] for n in names]))
     lines = alt.Chart(long).mark_line(strokeWidth=2).encode(**encoding)
     tooltip = [alt.Tooltip('Date:T', title='Month', format='%b %Y')] + \
@@ -198,12 +227,28 @@ st.caption("Four assets for four economic seasons: Harry Browne's Permanent Port
            "equities, long-term Treasuries, gold and Treasury bills. Backtested on monthly data and compared with a "
            "stock–bond benchmark. Group G · 2270 Financial Modeling · Nova SBE.")
 
-rets, cpi, source = get_data()
+rets, cpi, euro, source = get_data()
 MONTHS = list(rets.index.strftime('%Y-%m'))
 
 # Section 16: inflation and the return panel in real terms (every series deflated by the month's inflation)
 inflation, inflation_12m = an.inflation_rates(cpi, rets.index)
 real_rets = real_returns(rets, inflation)
+
+# Section 17: the panel in euros (converted at month-end exchange rates, unhedged), Euribor as the euro investor's
+# risk-free rate, and euro-area inflation (HICP)
+eurusd = euro['Dollars per euro'].dropna()
+dollar_return = an.dollar_returns(eurusd, rets.index)
+rf_eur = euro.loc[rets.index, 'Euribor return']
+hicp = euro['HICP']
+inflation_eur, inflation_eur_12m = an.inflation_rates(hicp, rets.index)
+euro_rets = in_euros(rets, dollar_return)
+euro_real_rets = real_returns(euro_rets, inflation_eur)
+rf_eur_real = real_returns(rf_eur, inflation_eur)
+
+# The four panels, keyed by (currency, terms): the returns and the risk-free rate of the performance measures
+# (None: the T-bill return of the panel)
+PANELS = {('USD', 'Nominal'): (rets, None), ('USD', 'Real'): (real_rets, None),
+          ('EUR', 'Nominal'): (euro_rets, rf_eur), ('EUR', 'Real'): (euro_real_rets, rf_eur_real)}
 
 
 def month_label(m):
@@ -244,8 +289,9 @@ with st.sidebar:
     period = st.select_slider('Investment period', options=MONTHS, value=(MONTHS[0], MONTHS[-1]),
                               format_func=month_label, key='period', bind='query-params',
                               help='The strategy starts from equal weights in the first month chosen.')
-    amount = st.number_input('Amount invested (USD)', min_value=100, max_value=100_000_000,
-                             value=DEFAULTS['amount'], step=1_000, key='amount', bind='query-params')
+    amount = st.number_input('Amount invested', min_value=100, max_value=100_000_000,
+                             value=DEFAULTS['amount'], step=1_000, key='amount', bind='query-params',
+                             help='In US dollars, or in euros when EUR is selected at the top of the page.')
     with st.expander('More assumptions'):
         stress_pct = st.slider('Stress-case cost per side (%)', 0.0, 2.0, DEFAULTS['cost_stress'], 0.05,
                                format='%.2f%%', key='cost_stress', bind='query-params',
@@ -283,7 +329,7 @@ with st.sidebar:
 
 with st.container(horizontal=True, vertical_alignment='center'):
     if source == 'live':
-        st.badge('Live data: Yahoo Finance and FRED', icon=':material/cloud_done:', color='green')
+        st.badge('Live data', icon=':material/cloud_done:', color='green')
     else:
         st.badge("Data saved by the notebook's run", icon=':material/save:', color='orange')
     if is_default:
@@ -291,24 +337,47 @@ with st.container(horizontal=True, vertical_alignment='center'):
     else:
         st.badge('Custom assumptions', icon=':material/tune:', color='violet')
     st.space('stretch')
+    currency = st.segmented_control('Currency', ['USD', 'EUR'], default='USD', required=True, key='currency',
+                                    bind='query-params', label_visibility='collapsed',
+                                    help='USD: results for an investor in US dollars. EUR: the same portfolios '
+                                         'measured in euros by an investor in the euro area who does not hedge the '
+                                         'currency, with Euribor as the risk-free rate (Section 17 of the notebook).')
     terms = st.segmented_control('Returns', ['Nominal', 'Real'], default='Nominal', required=True, key='terms',
                                  bind='query-params', label_visibility='collapsed',
-                                 help='Nominal: returns in US dollars. Real: returns after US consumer-price '
-                                      'inflation, with values at the prices of the month in which the money is '
+                                 help='Nominal: returns as measured in the currency. Real: returns after the '
+                                      'consumer-price inflation of the currency area (US CPI for dollars, euro-area '
+                                      'HICP for euros), with values at the prices of the month in which the money is '
                                       'invested.')
     view = st.segmented_control('View', ['Client', 'Analyst'], default='Client', required=True, key='view',
                                 bind='query-params', label_visibility='collapsed',
                                 help='Client: the key results in plain language. Analyst: every table and '
                                      'analysis of the notebook.')
 REAL = terms == 'Real'
+EUR = currency == 'EUR'
+SYM, CODE = ('€', 'EUR') if EUR else ('$', 'USD')
+GROWTH_ROW = f'Growth of {SYM}1'
+MONEY_FMT = ',.0f' if EUR else '$,.0f'          # Vega's number formats have no euro sign; axis titles name the euro
+RF_NAME = 'Euribor' if EUR else 'Treasury bills'
+# The consumer prices of the investor's currency area (Section 16 for dollars, Section 17 for euros)
+if EUR:
+    price_index, infl_m, infl_12m = hicp, inflation_eur, inflation_eur_12m
+    PRICES, PRICE_INDEX = 'euro-area consumer prices', 'harmonised index of consumer prices of the euro area (HICP)'
+    INDEX_SHORT = 'HICP'
+else:
+    price_index, infl_m, infl_12m = cpi, inflation, inflation_12m
+    PRICES, PRICE_INDEX = 'US consumer prices', 'US consumer price index (CPI-U)'
+    INDEX_SHORT = 'CPI'
+PRICES_CAP = PRICES[0].upper() + PRICES[1:]
 st.caption(f'Rule: {rule_text} · cost {cost:.2%} per side · benchmark {bench} VTI/AGG · '
-           f'{month_label(first)} to {month_label(last)}' + (' · returns after inflation' if REAL else ''))
+           f'{month_label(first)} to {month_label(last)}' + (' · in euros, unhedged' if EUR else '')
+           + (' · returns after inflation' if REAL else ''))
 
 if st.session_state.get('data_error') and source == 'saved':
     with st.container(border=True):
-        st.warning('Yahoo Finance or FRED did not respond, so the page uses the monthly returns and consumer prices '
-                   "saved by the notebook's own run, which cover the same months. Live data can be retried in a "
-                   'minute.', title='Data source busy, try again', icon=':material/cloud_off:')
+        st.warning('Yahoo Finance, FRED or the European Central Bank did not respond, so the page uses the monthly '
+                   "returns, consumer prices, exchange rates and Euribor rates saved by the notebook's own run, which "
+                   'cover the same months. Live data can be retried in a minute.', title='Data source busy, try again',
+                   icon=':material/cloud_off:')
 
         def retry():
             st.session_state['use_saved_data'] = False
@@ -317,8 +386,13 @@ if st.session_state.get('data_error') and source == 'saved':
 
         st.button('Try live data again', on_click=retry, icon=':material/refresh:', key='retry')
 
-nominal_p, real_p = rets.loc[first:last], real_rets.loc[first:last]
-rets_p = real_p if REAL else nominal_p            # every section below follows the choice of returns
+def panel_for(key):
+    # Returns and risk-free rate of one of the four panels over the chosen period
+    panel, rf = PANELS[key]
+    return panel.loc[first:last], None if rf is None else rf.loc[first:last]
+
+
+rets_p, rf_p = panel_for((currency, terms))      # every section below follows the choice of currency and returns
 if len(rets_p) < 36:
     st.warning('Choose a period of at least 36 months: shorter samples give unreliable estimates of '
                'volatility, beta and alpha.', icon=':material/date_range:')
@@ -328,43 +402,61 @@ if len(rets_p) < 36:
 # Model: the notebook's calculations under the chosen assumptions
 # ----------------------------------------------------------------------------------------------------------
 
-# Both runs are kept: the chosen one drives every section, and the Inflation tab compares the two
-runs = {t: an.simulate(p, low, high, check, cost, cost_stress, w_bench) for t, p in
-        (('Nominal', nominal_p), ('Real', real_p))}
-results, weights_after, weights_before = runs[terms]
-results_nom, results_real = runs['Nominal'][0], runs['Real'][0]
+# All four runs are kept: the chosen one drives every section, the Inflation tab compares nominal and real
+# returns in the chosen currency, and the Currency tab compares dollars and euros
+runs = {}
+for key in PANELS:
+    panel_k, rf_k = panel_for(key)
+    runs[key] = an.simulate(panel_k, low, high, check, cost, cost_stress, w_bench, rf=rf_k)
+results, weights_after, weights_before = runs[(currency, terms)]
+results_nom, results_real = runs[(currency, 'Nominal')][0], runs[(currency, 'Real')][0]
+real_p = panel_for((currency, 'Real'))[0]
+nominal_usd_p, nominal_eur_p = panel_for(('USD', 'Nominal'))[0], panel_for(('EUR', 'Nominal'))[0]
 perf_table, perf_vs_stocks = an.performance_tables(results, bench)
 perf_real = perf_table if REAL else an.performance_tables(results_real, bench)[0]
+perf_other = an.performance_tables(runs[('USD' if EUR else 'EUR', terms)][0], bench)[0]    # the other currency
 levels = sorted(set(an.COST_LEVELS + [cost, cost_stress]))
 with np.errstate(divide='ignore'):            # without trades the break-even cost is undefined
     cost_summary, sensitivity = an.cost_analysis(results, cost, cost_stress, levels)
 record = an.rebalancing_record(results, weights_before, cost, cost_stress)
-crisis_table, recovery_table = an.crisis_analysis(results, bench)
+# Crises are dated as in Section 14 (US equities in dollars) and measured in the chosen currency and terms
+dollar_p = dollar_return.loc[first:last]
+crisis_usd, recovery_usd = an.crisis_analysis(runs[('USD', 'Nominal')][0], bench)
+if (currency, terms) == ('USD', 'Nominal'):
+    crisis_table, recovery_table = crisis_usd, recovery_usd
+else:
+    crisis_table, recovery_table = an.crises_on_dates(results, crisis_usd, bench, dollar_p if EUR else None)
 rebalance_dates = list(results.index[results['turnover'] > 0])
 
 colors3 = P['series']
 names3 = [PP, bench, VTI]
 growth = pd.DataFrame({PP: an.wealth_index(results['pp_net']), bench: an.wealth_index(results['bench_6040']),
-                       VTI: an.wealth_index(results['stocks'])})          # value of $1, from 1 the month before
+                       VTI: an.wealth_index(results['stocks'])})     # value of one unit, from 1 the month before
 wealth = growth * amount
 start_ts = rets_p.index[0] - pd.DateOffset(months=1)        # the month-end at which the money is invested
 start_label, end_label = f'{start_ts:%B %Y}', f'{rets_p.index[-1]:%B %Y}'
-REAL_NOTE = ' All returns are after US consumer-price inflation.' if REAL else ''
+CUR_NOTE = ' All values are in euros, converted from US dollars at month-end exchange rates without hedging.' \
+    if EUR else ''
+REAL_NOTE = f' All returns are after {"euro-area" if EUR else "US"} consumer-price inflation.' if REAL else ''
+NOTE = CUR_NOTE + REAL_NOTE
 
-# Consumer prices over the chosen period (Section 16)
-cpi_p = cpi.loc[start_ts:rets_p.index[-1]]
-price_rise = cpi_p.iloc[-1] / cpi_p.iloc[0] - 1
+# Consumer prices of the currency area and the dollar against the euro over the chosen period
+prices_p = price_index.loc[start_ts:rets_p.index[-1]]
+price_rise = prices_p.iloc[-1] / prices_p.iloc[0] - 1
 inflation_rate = (1 + price_rise) ** (an.PERIODS / len(rets_p)) - 1
-inflation_p, inflation_12m_p = inflation.loc[first:last], inflation_12m.loc[first:last]
+inflation_p, inflation_12m_p = infl_m.loc[first:last], infl_12m.loc[first:last]
+dollar_gain = (1 + dollar_p).prod() - 1
 
 # KPI row: the Permanent Portfolio net of costs, with the difference from the frictionless benchmark
 pp_m, b_m = perf_table[PP], perf_table[bench]
 final_pp, final_b = amount * pp_m['Growth of $1'], amount * b_m['Growth of $1']
 diff_final = final_pp - final_b
 with st.container(horizontal=True):
-    st.metric(f'Real value of ${amount:,.0f}' if REAL else f'Value of ${amount:,.0f}', f'${final_pp:,.0f}',
-              f"{'+' if diff_final >= 0 else '-'}${abs(diff_final):,.0f}", delta_description=f'vs {bench}',
-              help=f'At {start_label} prices' if REAL else None, border=True)
+    st.metric(f'Real value of {money(amount)}' if REAL else f'Value of {money(amount)}', money(final_pp),
+              f"{'+' if diff_final >= 0 else '-'}{money(abs(diff_final))}", delta_description=f'vs {bench}',
+              help=(f'At {start_label} prices' if REAL else '') + (', in euros' if EUR and REAL else
+                                                                    'In euros' if EUR else '') or None,
+              border=True)
     st.metric('Real compound annual return' if REAL else 'Compound annual return', pct(pp_m['Compound annual return']),
               signed_pp(pp_m['Compound annual return'] - b_m['Compound annual return']),
               delta_description=f'vs {bench}', border=True)
@@ -376,9 +468,16 @@ with st.container(horizontal=True):
     st.metric('Maximum drawdown', pct(pp_m['Maximum drawdown']),
               signed_pp(pp_m['Maximum drawdown'] - b_m['Maximum drawdown']), delta_color='inverse',
               delta_description=f'vs {bench}', border=True)
+kpi_notes = []
+if EUR:
+    kpi_notes.append('in euros, every return is converted from US dollars at month-end exchange rates without hedging, '
+                     'and the Sharpe ratio is measured against Euribor')
 if REAL:
-    st.caption(f'After inflation: every return is deflated by US consumer prices (CPI-U), and values are at '
-               f'{start_label} prices.')
+    kpi_notes.append(f'after inflation, every return is deflated by {PRICES} ({INDEX_SHORT}) and values are at '
+                     f'{start_label} prices')
+if kpi_notes:
+    kpi_note = '; '.join(kpi_notes)
+    st.caption(kpi_note[0].upper() + kpi_note[1:] + '.')
 
 
 # ----------------------------------------------------------------------------------------------------------
@@ -389,11 +488,11 @@ def section_overview():
     # The key results in plain sentences, written from the computed numbers
     v_m = perf_table[VTI]
     lines = [
-        f"From the end of {start_label} to the end of {end_label}, ${amount:,.0f} in the Permanent Portfolio grew to "
-        f"**${final_pp:,.0f}**{f' at {start_label} prices' if REAL else ''}, a {'real ' if REAL else ''}compound "
-        f"return of {pct(pp_m['Compound annual return'])} a year, against "
-        f"${final_b:,.0f} ({pct(b_m['Compound annual return'])}) for the {bench} and "
-        f"${amount * v_m['Growth of $1']:,.0f} ({pct(v_m['Compound annual return'])}) for an all-equity portfolio.",
+        f"From the end of {start_label} to the end of {end_label}, {money(amount)} in the Permanent Portfolio grew "
+        f"to **{money(final_pp)}**{f' at {start_label} prices' if REAL else ''}, a {'real ' if REAL else ''}"
+        f"compound return of {pct(pp_m['Compound annual return'])} a year, against "
+        f"{money(final_b)} ({pct(b_m['Compound annual return'])}) for the {bench} and "
+        f"{money(amount * v_m['Growth of $1'])} ({pct(v_m['Compound annual return'])}) for an all-equity portfolio.",
         f"Its largest fall {'in purchasing power ' if REAL else ''}from a previous peak was "
         f"**{pct(pp_m['Maximum drawdown'], 1)}**, against "
         f"{pct(b_m['Maximum drawdown'], 1)} for the {bench} and {pct(v_m['Maximum drawdown'], 1)} for equities, "
@@ -416,34 +515,49 @@ def section_overview():
     lines.append(f"Per unit of risk it earned a Sharpe ratio of **{pp_m['Sharpe ratio']:.2f}**, against "
                  f"{b_m['Sharpe ratio']:.2f} for the {bench}.")
     if REAL:
-        lines.append(f"US consumer prices rose by {pct(price_rise, 1)} over the period, {pct(inflation_rate)} a year; "
-                     f"every value on this page is after inflation, at {start_label} prices.")
+        lines.append(f"{PRICES_CAP} rose by {pct(price_rise, 1)} over the period, "
+                     f"{pct(inflation_rate)} a year; every value on this page is after inflation, at {start_label} "
+                     "prices.")
     else:
-        lines.append(f"US consumer prices rose by {pct(price_rise, 1)} over the period, {pct(inflation_rate)} a year, "
-                     f"so after inflation the Permanent Portfolio grew by "
+        lines.append(f"{PRICES_CAP} rose by {pct(price_rise, 1)} over the period, "
+                     f"{pct(inflation_rate)} a year, so after inflation the Permanent Portfolio grew by "
                      f"{pct(perf_real.loc['Compound annual return', PP])} a year, against "
                      f"{pct(perf_real.loc['Compound annual return', bench])} for the {bench}. Select *Real* at the "
                      "top of the page to see every result after inflation.")
+    moved = f"{'gained' if dollar_gain >= 0 else 'lost'} {pct(abs(dollar_gain), 1)} against the euro"
+    real_word = 'real ' if REAL else ''
+    if EUR:
+        lines.append(f"Over the period the dollar {moved}; in dollars, the Permanent Portfolio returned "
+                     f"{pct(perf_other.loc['Compound annual return', PP])} a year{' in real terms' if REAL else ''}, "
+                     "against "
+                     f"{pct(perf_other.loc['Compound annual return', bench])} for the {bench}. Every value on this "
+                     "page is in euros, without hedging the currency.")
+    else:
+        lines.append(f"For an investor in the euro area who held the same funds without hedging the currency, the "
+                     f"Permanent Portfolio returned {pct(perf_other.loc['Compound annual return', PP])} a year in "
+                     f"{real_word}euros, against {pct(perf_other.loc['Compound annual return', bench])} for the "
+                     f"{bench}, as the dollar {moved}. Select *EUR* at the top of the page to see every result in "
+                     "euros.")
     with st.container(border=True):
         st.markdown('#### In brief')
         st.markdown('\n'.join(f'- {s}' for s in lines))
         st.caption(f'Permanent Portfolio net of {cost:.2%} costs per side; {bench} before costs. The sentences '
-                   'update with the assumptions in the sidebar.' + REAL_NOTE)
+                   'update with the assumptions in the sidebar.' + NOTE)
 
-    st.subheader(f'{"Real value" if REAL else "Value"} of ${amount:,.0f} invested at the end of {start_label}')
+    st.subheader(f'{"Real value" if REAL else "Value"} of {money(amount)} invested at the end of {start_label}')
     with st.container(horizontal=True, vertical_alignment='center'):
         st.space('stretch')
         log_scale = st.toggle('Log scale', key='log_scale')
         show_marks = st.toggle('Rebalancing dates', key='show_marks', value=True)
     shade, labels = crisis_shading(crisis_table)
     under = shade + ([vertical_marks(rebalance_dates)] if show_marks and 0 < len(rebalance_dates) <= 60 else [])
-    y_title = f'Value at {start_ts:%b %Y} prices (USD)' if REAL else 'Portfolio value (USD)'
-    st.altair_chart(time_chart(wealth, '$,.0f', y_title, 'wealth', colors3, log=log_scale,
+    y_title = f'Value at {start_ts:%b %Y} prices ({CODE})' if REAL else f'Portfolio value ({CODE})'
+    st.altair_chart(time_chart(wealth, MONEY_FMT, y_title, 'wealth', colors3, log=log_scale,
                                under=under, over=labels, height=400),
-                    alt=f'Growth of ${amount:,.0f} in the Permanent Portfolio, the {bench} benchmark and VTI, with '
+                    alt=f'Growth of {money(amount)} in the Permanent Portfolio, the {bench} benchmark and VTI, with '
                         'the equity crises shaded')
     st.caption('Shaded: equity crises, from the equity peak to the trough. Dashed lines: months in which the '
-               'portfolio was rebalanced back to 25% each.' + REAL_NOTE)
+               'portfolio was rebalanced back to 25% each.' + NOTE)
     show_data(wealth.round(2), file_name='portfolio_values.csv')
 
     left, right = st.columns([3, 2], gap='large')
@@ -451,26 +565,37 @@ def section_overview():
         st.markdown('**At a glance**')
         glance = ['Compound annual return', 'Annualized volatility', 'Sharpe ratio', 'Maximum drawdown',
                   'Growth of $1']
-        st.table(table_text(format_table(perf_table.loc[glance, names3])), alt='Key measures of the three portfolios')
+        st.table(table_text(format_table(relabel(perf_table.loc[glance, names3]))),
+                 alt='Key measures of the three portfolios')
     with right:
         st.markdown('**What the measures mean**')
         st.markdown(
             '- *Compound return*: the constant annual rate that turns the initial amount into the final value.\n'
             '- *Volatility*: how much monthly returns swing, annualized.\n'
-            '- *Sharpe ratio*: return above Treasury bills per unit of volatility.\n'
+            f'- *Sharpe ratio*: return above {RF_NAME} per unit of volatility.\n'
             '- *Maximum drawdown*: the largest fall from a previous peak in value.\n'
-            '- *Growth of $1*: what each dollar invested at the start became.')
+            f'- *{GROWTH_ROW}*: what each {"euro" if EUR else "dollar"} invested at the start became.')
 
 
 def section_performance():
-    st.subheader('Performance measures after inflation' if REAL else 'Performance measures')
+    heading = {('USD', 'Nominal'): 'Performance measures', ('USD', 'Real'): 'Performance measures after inflation',
+               ('EUR', 'Nominal'): 'Performance measures in euros',
+               ('EUR', 'Real'): 'Performance measures in euros, after inflation'}
+    basis = {('USD', 'Nominal'): '',
+             ('USD', 'Real'): ' All returns are after US consumer-price inflation, and the Sharpe ratio and alpha are '
+                              'measured against the real return of Treasury bills (Section 16 of the notebook).',
+             ('EUR', 'Nominal'): ' All returns are in euros, converted from US dollars at month-end exchange rates '
+                                 'without hedging, and the Sharpe ratio and alpha are measured against Euribor '
+                                 '(Section 17 of the notebook).',
+             ('EUR', 'Real'): ' All returns are in euros and after euro-area consumer-price inflation (HICP), and the '
+                              'Sharpe ratio and alpha are measured against the real return of Euribor (Section 17 of '
+                              'the notebook).'}
+    st.subheader(heading[(currency, terms)])
     st.caption(f'{month_label(first)} to {month_label(last)}. Permanent Portfolio net of {cost:.2%} (base) and '
                f'{cost_stress:.2%} (stress) costs per side; the benchmark without and with base costs. Beta, alpha, '
                f'tracking error and information ratio are measured against the frictionless {bench}; beta is not '
-               'annualized.' + (' All returns are after US consumer-price inflation, and the Sharpe ratio and alpha '
-                                'are measured against the real return of Treasury bills (Section 16 of the '
-                                'notebook).' if REAL else ''))
-    st.table(table_text(format_table(perf_table)), alt='Performance measures of the portfolios')
+               'annualized.' + basis[(currency, terms)])
+    st.table(table_text(format_table(relabel(perf_table))), alt='Performance measures of the portfolios')
     with st.container(horizontal=True):
         with st.container(border=True):
             st.markdown('**Relative to the all-equity portfolio (VTI)**')
@@ -481,15 +606,15 @@ def section_performance():
                 '- *Average return* is the mean monthly return × 12; *compound return* is the constant annual '
                 'rate that turns the initial amount into the final value.\n'
                 '- *Volatility* is the standard deviation of monthly returns × √12.\n'
-                '- *Sharpe ratio*: mean monthly return in excess of T-bills divided by its standard deviation, '
-                '× √12.\n'
+                f'- *Sharpe ratio*: mean monthly return in excess of {RF_NAME if EUR else "T-bills"} divided by its '
+                'standard deviation, × √12.\n'
                 '- *Beta*: sensitivity of the excess return to that of the benchmark. *Alpha*: the annualized '
                 'excess return that beta does not explain; a *t-statistic* above about 2 in absolute value '
                 'indicates significance at 5%.\n'
                 '- *Tracking error*: volatility of the return difference from the benchmark. *Information '
                 'ratio*: mean return difference divided by tracking error.\n'
                 '- *Maximum drawdown*: the largest fall from a previous peak in value.')
-    show_data(perf_table, 'Unformatted values', file_name='performance_measures.csv')
+    show_data(relabel(perf_table), 'Unformatted values', file_name='performance_measures.csv')
 
 
 def section_risk():
@@ -507,7 +632,7 @@ def section_risk():
         rolling = pd.DataFrame({n: series[n].rolling(36).std() * np.sqrt(an.PERIODS) for n in series}).dropna()
         st.altair_chart(time_chart(rolling, '.0%', 'Annualized volatility', 'roll', colors3, height=300),
                         alt='Rolling 36-month volatility of the three portfolios')
-        st.caption('Standard deviation of the previous 36 monthly returns, annualized.' + REAL_NOTE)
+        st.caption('Standard deviation of the previous 36 monthly returns, annualized.' + NOTE)
     with right:
         st.subheader('Risk and return')
         assets = {PP: results['pp_net'], bench: results['bench_6040'], VTI: results['stocks'],
@@ -534,7 +659,7 @@ def section_risk():
             text='Portfolio or asset:N', color=alt.value(P['ink'])).transform_filter(alt.datum.Side == 'below')
         st.altair_chart(alt.layer(points, label_right, label_left, label_below).properties(height=300),
                         alt='Annualized mean return against volatility for the portfolios and their constituents')
-        st.caption('The three portfolios in colour; the constituents and the bond index in grey.' + REAL_NOTE)
+        st.caption('The three portfolios in colour; the constituents and the bond index in grey.' + NOTE)
     show_data(rr.drop(columns=['Colour', 'Side']).set_index('Portfolio or asset'), 'Show risk and return data')
 
 
@@ -586,7 +711,7 @@ def section_rebalancing():
     st.table(table_text(format_table(sensitivity.loc[rows_shown])), alt='Performance by cost rate per side')
     st.caption(f'Cost per dollar traded, on each side of a trade. Alpha and information ratio relative to the '
                f'{bench}. Because costs enter returns linearly, alpha falls in a straight line as the cost rate '
-               'rises; the break-even cost is the rate at which it reaches zero.' + REAL_NOTE)
+               'rises; the break-even cost is the rate at which it reaches zero.' + NOTE)
 
 
 def section_crises():
@@ -615,9 +740,11 @@ def section_crises():
         facet=alt.Facet('Episode:N', sort=order, title=None, header=alt.Header(labelFontSize=12)), columns=3)
     st.altair_chart(small, alt='Value of each portfolio from the equity peak, in each of the five crises')
     st.caption('Each panel starts at the equity peak (value 100) and runs to two years after the equity trough. '
-               'The crises are dated as in Section 14 of the notebook: the lowest month-end of VTI within a search '
-               'window and the highest month-end before it.' +
-               (' After inflation, both the dates and the returns are those of real wealth.' if REAL else ''))
+               'The crises are dated as in Section 14 of the notebook: the lowest month-end of VTI in dollars within '
+               'a search window and the highest month-end before it.' +
+               (' The returns are measured over the same months, ' + ('in euros' if EUR else '') +
+                (' and ' if EUR and REAL else '') + ('after inflation' if REAL else '') + '.'
+                if EUR or REAL else ''))
 
     st.subheader('Return from the equity peak to the equity trough')
     bars = crisis_table[names3].reset_index().melt('Episode', var_name='Portfolio', value_name='Return')
@@ -637,13 +764,17 @@ def section_crises():
     st.altair_chart(alt.layer(columns, zero, up, down).properties(height=340),
                     alt='Peak-to-trough returns of the three portfolios in five equity crises')
 
-    left, right = st.columns([3, 2], gap='large')
+    # In euros the return table has a further column, so the two tables are stacked at full width
+    left, right = (st.container(), st.container()) if EUR else st.columns([3, 2], gap='large')
     with left:
         st.markdown('**Peak-to-trough returns**')
         shown = crisis_table.copy()
-        for p in names3:
+        for p in shown.columns[3:]:                  # the portfolios and, in euros, the dollar against the euro
             shown[p] = [pct(v, 1) for v in crisis_table[p]]
         st.table(shown, alt='Peak-to-trough returns by episode')
+        if EUR:
+            st.caption('Dollar against the euro: the change in the value of one dollar in euros over the same '
+                       'months.')
     with right:
         st.markdown('**Months from the equity peak to recovery**')
         st.table(recovery_table.map(lambda v: 'not recovered' if pd.isna(v) else f'{int(v)}'),
@@ -709,7 +840,7 @@ def section_regimes():
                                for s in SLEEVES)
                    + '. * Partial year.')
 
-        st.subheader('Calendar-year real returns of each sleeve' if REAL else 'Calendar-year returns of each sleeve')
+        st.subheader(f"Calendar-year {'real ' if REAL else ''}returns of each sleeve{' in euros' if EUR else ''}")
         grid = st.columns(2)
         for i, s in enumerate(SLEEVES):
             df = pd.DataFrame({'Year': lead['Year'], 'Return': cal[s].values})
@@ -728,8 +859,8 @@ def section_rules():
     st.subheader('The strategy under alternative rebalancing rules')
     st.caption(f'Each rule is simulated with the same engine over the chosen period, net of {cost:.2%} costs per '
                f'side; alpha and the information ratio are relative to the {bench}. The strategy uses Browne\'s '
-               'tolerance band of 15–35%, reviewed monthly.' + REAL_NOTE)
-    rules_tbl = rule_table(rets_p, cost, w_bench).copy()
+               'tolerance band of 15–35%, reviewed monthly.' + NOTE)
+    rules_tbl = rule_table(rets_p, rf_p, cost, w_bench).copy()
 
     # Locate the current settings in the grid, or add them as a row of their own
     if rule == 'Buy and hold':
@@ -791,16 +922,21 @@ def section_rules():
 
 
 def section_calendar():
-    st.subheader('Calendar-year real returns' if REAL else 'Calendar-year returns')
+    st.subheader(f"Calendar-year {'real ' if REAL else ''}returns{' in euros' if EUR else ''}")
     cal_src = pd.DataFrame({PP: results['pp_net'], bench: results['bench_6040'], VTI: results['stocks'],
                             'TLT': rets_p['TLT'], 'GLD': rets_p['GLD'], 'AGG': rets_p['AGG'],
                             'T-bills': rets_p['rf']})
     cal = an.calendar_returns(cal_src)
-    cal['Inflation (CPI)'] = an.calendar_returns(inflation_p.to_frame('Inflation'))['Inflation']
+    # Columns shown for reference: the inflation of the currency area and, in euros, the dollar against the euro
+    references = {f'Inflation ({INDEX_SHORT})': inflation_p}
+    if EUR:
+        references['Dollar in euros'] = dollar_p
+    for name in references:
+        cal[name] = an.calendar_returns(references[name].to_frame('x'))['x']
     counts = cal_src.groupby(cal_src.index.year).size()
     cal.index = [f'{y}*' if counts[y] < 12 else str(y) for y in cal.index]
     heat = cal.rename_axis('Year').reset_index().melt('Year', var_name='Series', value_name='Return')
-    returns_only = heat[heat['Series'] != 'Inflation (CPI)']
+    returns_only = heat[~heat['Series'].isin(list(references))]
     lim = float(min(0.4, returns_only['Return'].abs().max()))
     x = alt.X('Series:N', sort=list(cal.columns), title=None,
               axis=alt.Axis(orient='top', labelAngle=0, labelLimit=120, labelOverlap=False,
@@ -813,26 +949,29 @@ def section_calendar():
                         legend=alt.Legend(title='Return', format='.0%', orient='bottom', direction='horizontal',
                                           gradientLength=220)),
         tooltip=['Year', 'Series', alt.Tooltip('Return:Q', format='.1%')])
-    # Inflation is shown for reference, on a neutral background rather than on the scale of returns
-    rects_cpi = alt.Chart(heat[heat['Series'] == 'Inflation (CPI)']).mark_rect(
+    # The reference columns are shown on a neutral background rather than on the scale of returns
+    rects_reference = alt.Chart(heat[heat['Series'].isin(list(references))]).mark_rect(
         cornerRadius=3, color=P['mid'], stroke=P['soft'], strokeWidth=1).encode(
-        x=x, y=y, tooltip=['Year', alt.Tooltip('Return:Q', title='Inflation', format='.1%')])
+        x=x, y=y, tooltip=['Year', 'Series', alt.Tooltip('Return:Q', title='Change', format='.1%')])
     text = alt.Chart(heat).mark_text(fontSize=11, color=P['ink']).encode(
         x=x, y=y, text=alt.Text('Return:Q', format='.1%'))
-    st.altair_chart(alt.layer(rects, rects_cpi, text).properties(height=24 * len(cal) + 80),
+    st.altair_chart(alt.layer(rects, rects_reference, text).properties(height=24 * len(cal) + 80),
                     alt='Calendar-year returns of the portfolios and of each asset, with the inflation of each year')
     st.caption('Portfolio returns net of costs for the Permanent Portfolio. * Partial year: only the months inside '
-               'the chosen period. Blue years are gains, red years losses. Inflation (CPI): the change in US consumer '
-               'prices over the same months, for reference.' + REAL_NOTE)
+               f'the chosen period. Blue years are gains, red years losses. Inflation ({INDEX_SHORT}): the change in '
+               f'{PRICES} over the same months, for reference.'
+               + (' Dollar in euros: the change in the value of one dollar in euros, which compounds with the dollar '
+                  'return of every asset to give its return in euros.' if EUR else '') + NOTE)
     show_data(cal, file_name='calendar_returns.csv')
 
 
 def section_inflation():
-    # Section 16 of the notebook for the chosen period: purchasing power, real returns and inflation regimes
+    # Section 16 of the notebook for the chosen period: purchasing power, real returns and inflation regimes. In
+    # euros, the same analysis with euro-area inflation (the HICP of Section 17).
     r_pp, r_b = perf_real[PP], perf_real[bench]
     kpi = st.columns(4)
     kpi[0].metric('Rise in consumer prices', pct(price_rise, 1), border=True,
-                  help=f'US consumer price index (CPI-U) from {start_label} to {end_label}')
+                  help=f'{PRICE_INDEX[0].upper() + PRICE_INDEX[1:]} from {start_label} to {end_label}')
     kpi[1].metric('Average inflation', pct(inflation_rate), border=True,
                   help='Compound annual rate of inflation over the period')
     kpi[2].metric('Real compound return', pct(r_pp['Compound annual return']),
@@ -849,14 +988,14 @@ def section_inflation():
     values = amount * pd.DataFrame({PP: an.wealth_index(results_nom['pp_net']),
                                     bench: an.wealth_index(results_nom['bench_6040']),
                                     VTI: an.wealth_index(results_nom['stocks'])})
-    values['US consumer prices'] = amount * cpi_p / cpi_p.iloc[0]
-    st.altair_chart(time_chart(values, '$,.0f', 'Value (USD)', 'keep', colors3 + [P['muted']],
-                               dashed=['US consumer prices'], height=360),
-                    alt=f'Nominal value of ${amount:,.0f} in each portfolio against the amount needed to keep pace '
+    values[PRICES_CAP] = amount * prices_p / prices_p.iloc[0]
+    st.altair_chart(time_chart(values, MONEY_FMT, f'Value ({CODE})', 'keep', colors3 + [P['muted']],
+                               dashed=[PRICES_CAP], height=360),
+                    alt=f'Nominal value of {money(amount)} in each portfolio against the amount needed to keep pace '
                         'with consumer prices')
-    st.caption(f'Value in US dollars of ${amount:,.0f} invested at the end of {start_label}. The dashed line is the '
-               'amount that keeps the purchasing power of the initial investment: a portfolio above it has grown in '
-               'real terms.')
+    st.caption(f'Value in {"euros" if EUR else "US dollars"} of {money(amount)} invested at the end of {start_label}. '
+               'The dashed line is the amount that keeps the purchasing power of the initial investment: a portfolio '
+               'above it has grown in real terms.' + CUR_NOTE)
     show_data(values.round(2), file_name='purchasing_power.csv')
 
     st.subheader('Inflation over the previous twelve months')
@@ -870,7 +1009,7 @@ def section_inflation():
         st.info('Choose a lower threshold below the upper threshold.', icon=':material/tune:')
         with brief:
             st.markdown('#### In brief')
-            st.markdown(f'US consumer prices rose by {pct(price_rise, 1)} from {start_label} to {end_label}.')
+            st.markdown(f'{PRICES_CAP} rose by {pct(price_rise, 1)} from {start_label} to {end_label}.')
         return
     regime_table, regime = an.inflation_regimes(real_p, results_real, inflation_12m_p, (lo, hi), bench)
     labels = list(regime_table.columns)
@@ -889,9 +1028,9 @@ def section_inflation():
     st.altair_chart(time_chart(inflation_12m_p.to_frame('Inflation over the previous 12 months'), '.1%',
                                'Inflation, previous 12 months', 'infl', [P['ink']], under=[band_rects, band_text],
                                height=260, y_domain=[y_min, y_max], legend=False),
-                    alt='US consumer-price inflation over the previous twelve months, with the low and high '
-                        'inflation regimes shaded')
-    st.caption('Change in US consumer prices (CPI-U) over the twelve months to each month-end. The shaded bands are '
+                    alt=f'{PRICES_CAP}: inflation over the previous twelve months, with the low and high inflation '
+                        'regimes shaded')
+    st.caption(f'Change in {PRICES} ({INDEX_SHORT}) over the twelve months to each month-end. The shaded bands are '
                'the low and high inflation regimes, coloured as the deflation and inflation seasons of the four-'
                'seasons graphic.')
 
@@ -932,8 +1071,8 @@ def section_inflation():
     full = [y for y in cal.index if counts[y] == 12]
 
     # The plain-language summary, written from the numbers above
-    notes = [f"US consumer prices rose by **{pct(price_rise, 1)}** from {start_label} to {end_label}, "
-             f"{pct(inflation_rate)} a year: ${amount:,.0f} at the end buys what ${amount / (1 + price_rise):,.0f} "
+    notes = [f"{PRICES_CAP} rose by **{pct(price_rise, 1)}** from {start_label} to {end_label}, "
+             f"{pct(inflation_rate)} a year: {money(amount)} at the end buys what {money(amount / (1 + price_rise))} "
              f"bought at the start. After inflation, the Permanent Portfolio grew by "
              f"**{pct(r_pp['Compound annual return'])}** a year, against {pct(r_b['Compound annual return'])} for "
              f"the {bench}."]
@@ -942,8 +1081,9 @@ def section_inflation():
         t = regime_table[high]
         positive = [s for s in SLEEVES if t[s] > 0]
         best = t[SLEEVES].idxmax()
-        lead = (f"{SHORT[positive[0]].capitalize()} was the only sleeve with a positive real return "
-                f"({pct(t[positive[0]], 1)} a year)" if len(positive) == 1 else
+        only = positive[0] if len(positive) == 1 else None
+        lead = (f"{SHORT[only][0].upper() + SHORT[only][1:]} {'was' if only == 'Gold (GLD)' else 'were'} the only "
+                f"sleeve with a positive real return ({pct(t[only], 1)} a year)" if only else
                 f"The best sleeve was {SHORT[best]} ({pct(t[best], 1)} a year)")
         notes.append(f"In the {int(months[high])} months in which inflation over the previous year exceeded "
                      f"{threshold(hi)}, the Permanent Portfolio returned **{pct(t[PP], 1)}** a year after inflation, "
@@ -969,13 +1109,17 @@ def section_inflation():
                      f"{pct(two[bench], 1)} for the {bench}.")
     bills = regime_table.loc['Treasury bills', shown]
     if (bills < 0).all():
-        notes.append('Treasury bills lost purchasing power in every inflation regime.')
+        notes.append(f"{'US Treasury bills, measured in euros,' if EUR else 'Treasury bills'} lost purchasing power "
+                     "in every inflation regime.")
     with brief:
         st.markdown('#### In brief')
         st.markdown('\n'.join(f'- {s}' for s in notes))
         st.caption(f'Inflation regimes: {threshold(lo)} and {threshold(hi)} over the previous twelve months. '
-                   'Section 16 of the notebook discusses these results; Erb and Harvey (2013) find that gold has been '
-                   'an unreliable inflation hedge over the horizons that matter to most investors.')
+                   + ('This tab applies the analysis of Section 16 of the notebook to euro-area inflation and to '
+                      'returns in euros (Section 17); Section 16 discusses the results for a US investor. '
+                      if EUR else 'Section 16 of the notebook discusses these results; ')
+                   + f'{"E" if EUR else "e"}rb and Harvey (2013) find that gold has been an unreliable inflation hedge '
+                   'over the horizons that matter to most investors.')
 
     if len(full) >= 3:
         st.subheader('Each calendar year: inflation and the real return')
@@ -1008,9 +1152,174 @@ def section_inflation():
         show_data(cal, 'Show calendar-year inflation and real returns', file_name='calendar_real_returns.csv')
 
 
+def section_currency():
+    # Section 17 of the notebook for the chosen period: the same portfolios measured in euros, without hedging.
+    # Nominal returns in both currencies, so that the comparison isolates the exchange rate.
+    res_usd, res_eur = runs[('USD', 'Nominal')][0], runs[('EUR', 'Nominal')][0]
+    p_usd = an.performance_tables(res_usd, bench)[0]
+    p_eur = an.performance_tables(res_eur, bench)[0]
+    kpi = st.columns(4)
+    kpi[0].metric('Dollar against the euro', f'{dollar_gain:+.1%}', border=True,
+                  help=f'Change in the value of one US dollar in euros from the end of {start_label} to the end of '
+                       f'{end_label}')
+    for col, (label, row, inverse) in zip(kpi[1:], [('Return in euros', 'Compound annual return', False),
+                                                    ('Volatility in euros', 'Annualized volatility', True),
+                                                    ('Drawdown in euros', 'Maximum drawdown', True)]):
+        col.metric(label, pct(p_eur.loc[row, PP]), signed_pp(p_eur.loc[row, PP] - p_usd.loc[row, PP]),
+                   delta_color='inverse' if inverse else 'normal', delta_description='vs in dollars', border=True,
+                   help=f'{row} of the Permanent Portfolio measured in euros, compared with its value in dollars')
+    brief = st.container(border=True)          # filled at the end, once the crises are computed
+    if REAL:
+        st.caption('This tab compares returns before inflation, to isolate the effect of the exchange rate; the '
+                   'table at the bottom also shows them after the inflation of each currency area.')
+
+    st.subheader('The same investment in euros and in dollars')
+    values = amount * pd.DataFrame({f'{PP} in euros': an.wealth_index(res_eur['pp_net']),
+                                    f'{bench} in euros': an.wealth_index(res_eur['bench_6040']),
+                                    f'{PP} in dollars': an.wealth_index(res_usd['pp_net']),
+                                    f'{bench} in dollars': an.wealth_index(res_usd['bench_6040'])})
+    in_dollars = [c for c in values if c.endswith('in dollars')]
+    st.altair_chart(time_chart(values, ',.0f', 'Value (euros or dollars)', 'twocur', colors3[:2] * 2,
+                               dashed=in_dollars, height=380),
+                    alt=f'Value of {amount:,.0f} euros and of {amount:,.0f} dollars invested in the Permanent '
+                        f'Portfolio and in the {bench}')
+    st.caption(f'Solid lines: €{amount:,.0f} invested at the end of {start_label}, measured in euros. Dashed lines: '
+               f'${amount:,.0f} invested at the same date, measured in dollars. The euro investor holds the same '
+               'dollar funds and converts at month-end exchange rates, without hedging.')
+    show_data(values.round(2), file_name='values_in_two_currencies.csv')
+
+    st.subheader('The dollar against the euro')
+    rate = (1 / eurusd).loc[start_ts:rets_p.index[-1]].to_frame('Euros per US dollar')
+    shade, labels = crisis_shading(crisis_usd)
+    st.altair_chart(time_chart(rate, '.2f', 'Euros per US dollar', 'fx', [P['ink']], under=shade, over=labels,
+                               height=260, legend=False),
+                    alt='Euros per US dollar at each month-end, with the equity crises shaded')
+    st.caption('Euros per US dollar at each month-end (FRED, DEXUSEU: noon buying rates in New York). When the line '
+               'rises, the dollar gains against the euro and dollar assets gain value in euros. Shaded: the equity '
+               'crises of Section 14, from the equity peak to the trough.')
+
+    crises_eur = an.crises_on_dates(res_eur, crisis_usd, bench, dollar_p)[0] if not crisis_usd.empty else None
+    if crises_eur is not None:
+        st.subheader('Each equity crisis in euros and in dollars')
+        both = pd.DataFrame({'Equity peak': crisis_usd['Equity peak'], 'Equity trough': crisis_usd['Equity trough'],
+                             f'{PP}, in dollars': crisis_usd[PP], f'{PP}, in euros': crises_eur[PP],
+                             f'{bench}, in dollars': crisis_usd[bench], f'{bench}, in euros': crises_eur[bench],
+                             'Dollar against the euro': crises_eur['Dollar against the euro']})
+        shown = both.copy()
+        for c in shown.columns[2:]:
+            shown[c] = [pct(v, 1) for v in both[c]]
+        st.table(shown, alt='Peak-to-trough return of each portfolio in dollars and in euros, and the change in the '
+                            'dollar, in each equity crisis')
+        st.caption('Return from the equity peak to the equity trough, with the crises dated as in Section 14 of the '
+                   'notebook. Dollar against the euro: the change in the value of one dollar in euros over the same '
+                   'months.')
+
+    st.subheader('Risk in each currency')
+    effects = an.currency_effects(nominal_usd_p, res_usd, nominal_eur_p, res_eur, dollar_p, bench)
+    vols = effects[['Volatility in dollars', 'Volatility in euros']].rename(
+        columns=lambda c: c.replace('Volatility in ', 'In ')).rename_axis('Series').reset_index().melt(
+        'Series', var_name='Measured', value_name='Volatility')
+    order = list(effects.index)
+    bars = alt.Chart(vols).mark_bar(cornerRadiusEnd=3, height={'band': 0.8}).encode(
+        y=alt.Y('Series:N', sort=order, title=None, axis=alt.Axis(labelLimit=220)),
+        yOffset=alt.YOffset('Measured:N', sort=['In dollars', 'In euros']),
+        x=alt.X('Volatility:Q', axis=alt.Axis(format='.0%'), title='Annualized volatility'),
+        color=alt.Color('Measured:N', scale=alt.Scale(domain=['In dollars', 'In euros'], range=[P['soft'], P['ink']]),
+                        legend=alt.Legend(title=None, orient='top')),
+        tooltip=['Series', 'Measured', alt.Tooltip('Volatility:Q', format='.2%')])
+    st.altair_chart(bars.properties(height=46 * len(order) + 40),
+                    alt='Annualized volatility of each asset and portfolio, in dollars and in euros')
+    shown = effects.copy()
+    for c in shown.columns:
+        shown[c] = [f'{v:.2f}' if c.startswith('Correlation') else pct(v) for v in effects[c]]
+    st.table(shown, alt='Compound return and volatility in each currency, and correlation with the dollar')
+    st.caption('Correlation with the dollar: between the monthly dollar return of each series and the return of the '
+               'dollar against the euro. A negative correlation means that the dollar tended to rise against the euro '
+               'when the series fell, which lowers its volatility in euros; a series that does not move with the '
+               'dollar, such as Treasury bills, takes on the volatility of the exchange rate.')
+
+    st.subheader('Dollars and euros, nominal and real')
+    tables = {'Dollars': p_usd, 'Dollars, real': an.performance_tables(runs[('USD', 'Real')][0], bench)[0],
+              'Euros': p_eur, 'Euros, real': an.performance_tables(runs[('EUR', 'Real')][0], bench)[0]}
+    view_table = an.perspective_table(tables, bench)
+    left, right = st.columns(2, gap='large')
+    for col, p in zip((left, right), (PP, bench)):
+        with col:
+            st.markdown(f'**{p}**')
+            part = view_table[p]
+            if p == bench:
+                part = part.drop(['Annualized alpha', 'Alpha t-statistic'])
+            st.table(table_text(format_table(part)), alt=f'Main measures of the {p} in dollars and in euros')
+    st.caption('Real: after US consumer-price inflation for dollars and after euro-area inflation (HICP) for euros. '
+               'The Sharpe ratio and alpha are measured against Treasury bills in dollars and against Euribor in '
+               f'euros; alpha relative to the {bench}.')
+
+    # The plain-language summary, written from the numbers above
+    moved = f"{'gained' if dollar_gain >= 0 else 'lost'} **{pct(abs(dollar_gain), 1)}** against the euro"
+    falling = nominal_usd_p['VTI'] < 0
+    notes = [f"From the end of {start_label} to the end of {end_label}, the dollar {moved}. Measured in euros, "
+             f"without hedging, the Permanent Portfolio returned **{pct(p_eur.loc['Compound annual return', PP])}** a "
+             f"year, against {pct(p_usd.loc['Compound annual return', PP])} in dollars, and the {bench} "
+             f"{pct(p_eur.loc['Compound annual return', bench])}, against "
+             f"{pct(p_usd.loc['Compound annual return', bench])}.",
+             f"In euros, the volatility of the Permanent Portfolio was {pct(p_eur.loc['Annualized volatility', PP])} "
+             f"({pct(p_usd.loc['Annualized volatility', PP])} in dollars) and its largest drawdown "
+             f"**{pct(p_eur.loc['Maximum drawdown', PP])}** ({pct(p_usd.loc['Maximum drawdown', PP])} in dollars); "
+             f"its Sharpe ratio against Euribor was {p_eur.loc['Sharpe ratio', PP]:.2f}, against "
+             f"{p_eur.loc['Sharpe ratio', bench]:.2f} for the {bench}."]
+    if falling.any() and (~falling).any():
+        down, up = dollar_p[falling].mean(), dollar_p[~falling].mean()
+        notes.append(f"On average, the dollar {'gained' if down >= 0 else 'lost'} {pct(abs(down))} against the euro "
+                     f"in the months in which US equities fell, and {'gained' if up >= 0 else 'lost'} "
+                     f"{pct(abs(up))} in those in which they rose.")
+    if crises_eur is not None:
+        n_crises = len(crises_eur)
+        rose = int((crises_eur['Dollar against the euro'] > 0).sum())
+        better = int((crises_eur[PP] > crisis_usd[PP]).sum())
+        gained = int((crises_eur[PP] > 0).sum())
+        notes.append(f"The dollar rose against the euro in "
+                     f"{f'all {n_crises}' if rose == n_crises else f'{rose} of the {n_crises}'} equity crises of the "
+                     f"period, and the Permanent Portfolio did better in euros than in dollars in "
+                     f"{'all of them' if better == n_crises else f'{better} of them'}"
+                     + (f", gaining value in euros from the equity peak to the trough in {gained}" if gained else '')
+                     + '.')
+    with brief:
+        st.markdown('#### In brief')
+        st.markdown('\n'.join(f'- {s}' for s in notes))
+        st.caption('Section 17 of the notebook discusses these results. They depend on the path of the exchange rate '
+                   'over the chosen period, and they leave out currency hedging, which would remove most of the '
+                   'effect of the exchange rate at a cost or gain set by the difference between dollar and euro '
+                   'interest rates.')
+
+
 def section_method():
     left, right = st.columns([3, 2], gap='large')
     with left:
+        st.subheader('Consistency with the notebook')
+        checks = []
+        for label, (panel, rf), saved_name in (
+                ('Table 1 of the notebook', PANELS[('USD', 'Nominal')], 'table1_performance.csv'),
+                ('the real-terms Table 1 of Section 16', PANELS[('USD', 'Real')], 'table1_real_terms.csv'),
+                ('Table 1 in euros of Section 17', PANELS[('EUR', 'Nominal')], 'table1_euros.csv'),
+                ('Table 1 in real euros of Section 17', PANELS[('EUR', 'Real')], 'table1_euros_real.csv')):
+            res_d, _, _ = an.simulate(panel, rf=rf)
+            table_d, _ = an.performance_tables(res_d)
+            reference = notebook_table(saved_name)
+            if 'Growth of €1' in reference.index:            # Section 17 labels the last row in euros
+                table_d = table_d.rename(index={'Growth of $1': 'Growth of €1'})
+            checks.append((label, table_d - reference, reference.notna().sum().sum()))
+        for label, diff, n_values in checks:
+            gap = diff.abs().max().max()
+            if gap < 5e-5:
+                st.success(f'With the notebook\'s assumptions, the app reproduces {label} to four decimals (largest '
+                           f'difference across the {n_values} reported values: {gap:.1e}).', icon=':material/verified:')
+            else:
+                st.error(f'The app differs from {label} by up to {gap:.2e}.', icon=':material/error:')
+        st.caption('Checked on every load against table1_performance.csv, table1_real_terms.csv, table1_euros.csv and '
+                   'table1_euros_real.csv in notebook/outputs. The automated tests in the repository also verify that '
+                   'the functions in core.py are identical to the notebook\'s.')
+        show_data(checks[0][1], 'Show the differences', file_name='consistency_check.csv')
+
         st.subheader('Method')
         st.markdown(
             'The portfolio starts with 25% in VTI, TLT, GLD and Treasury bills, after which the weights drift '
@@ -1031,49 +1340,48 @@ def section_method():
             'money is invested, and the Sharpe ratio and alpha are measured against the real return of Treasury '
             'bills. The index for October 2025, which the Bureau of Labor Statistics did not publish because prices '
             'were not collected during the federal shutdown, is the geometric mean of September and November.\n\n'
+            'With *EUR* selected, the same portfolios are measured by an investor in the euro area who holds the '
+            'dollar funds without hedging the currency, as in Section 17 of the notebook. Every monthly return, '
+            'Treasury bills included, is converted at month-end exchange rates (FRED, DEXUSEU: noon buying rates in '
+            'New York), (1 + r)(1 + e) − 1, where e is the monthly change in the value of one dollar in euros; the '
+            'conversion leaves every rebalancing decision unchanged. The risk-free rate of the Sharpe ratio and '
+            'alpha is the three-month Euribor (European Central Bank), divided by 12 and lagged one month like the '
+            'Treasury-bill rate, and *Real* deflates returns in euros by euro-area inflation, measured by the '
+            'harmonised index of consumer prices (FRED, CP0000EZCCM086NEST, from Eurostat). Crises keep the dates '
+            'of Section 14, determined by US equities in dollars, in every currency and terms.\n\n'
             'The assumptions in the sidebar are passed to the same functions the notebook uses. Changing the '
             'period restarts the strategy from equal weights in the first month chosen, which differs from the '
             'sub-period estimates in Section 15 of the notebook, where the full-sample backtest is evaluated '
             'over shorter windows. The overview sentences, the sleeve leaders and the crisis panels present '
-            'results the notebook reports in its tables, and the Inflation tab presents the analysis of Section 16 '
-            'for the chosen period and inflation thresholds.')
-
-        st.subheader('Consistency with the notebook')
-        checks = []
-        for label, panel, saved_name in (('Table 1', rets, 'table1_performance.csv'),
-                                         ('the real-terms Table 1 of Section 16', real_rets, 'table1_real_terms.csv')):
-            res_d, _, _ = an.simulate(panel)
-            table_d, _ = an.performance_tables(res_d)
-            reference = notebook_table(saved_name)
-            checks.append((label, table_d - reference, reference.notna().sum().sum()))
-        for label, diff, n_values in checks:
-            gap = diff.abs().max().max()
-            if gap < 5e-5:
-                st.success(f'With the notebook\'s assumptions the app reproduces {label} of the notebook to four '
-                           f'decimals (largest difference across the {n_values} reported values: {gap:.1e}).',
-                           icon=':material/verified:')
-            else:
-                st.error(f'The app differs from {label} of the notebook by up to {gap:.2e}.', icon=':material/error:')
-        st.caption('Checked on every load against notebook/outputs/table1_performance.csv and '
-                   'table1_real_terms.csv. The automated tests in the repository also verify that the functions in '
-                   'core.py are identical to the notebook\'s.')
-        show_data(checks[0][1], 'Show the differences', file_name='consistency_check.csv')
+            'results the notebook reports in its tables, the Inflation tab presents the analysis of Section 16 '
+            'for the chosen period, currency and inflation thresholds, and the Currency tab that of Section 17 for '
+            'the chosen period.')
     with right:
         st.subheader('Data')
+        sample = f'{month_label(MONTHS[0])} to {month_label(MONTHS[-1])}'
         st.table(pd.DataFrame({
-            'Series': ['VTI, TLT, GLD, AGG', 'TB3MS', 'CPIAUCNS (CPI-U)'],
-            'Source': ['Yahoo Finance (yfinance)', 'FRED, St. Louis Fed', 'FRED (Bureau of Labor Statistics)'],
-            'Months': [f'{month_label(MONTHS[0])} to {month_label(MONTHS[-1])}'] * 2
-                      + [f'{cpi.index[0]:%b %Y} to {cpi.index[-1]:%b %Y}'],
-            'Observations': [len(rets)] * 2 + [len(cpi)]}).set_index('Series'), alt='Data sources')
-        st.caption('Returns cover the months of the sample; the price index starts twelve months earlier, so that '
-                   'inflation over the previous twelve months is defined from the first month. Live data are '
-                   'downloaded once per server session. If a source does not respond, the app uses the data saved '
-                   'by the notebook\'s own run, and says so at the top of the page.')
+            'Series': ['VTI, TLT, GLD, AGG', 'TB3MS', 'CPIAUCNS (CPI-U)', 'DEXUSEU (dollars per euro)',
+                       'Euribor, three months', 'HICP, euro area'],
+            'Source': ['Yahoo Finance (yfinance)', 'FRED, St. Louis Fed', 'FRED (Bureau of Labor Statistics)',
+                       'FRED (Federal Reserve Board)', 'European Central Bank', 'FRED (Eurostat)'],
+            'Months': [sample, sample, f'{cpi.index[0]:%b %Y} to {cpi.index[-1]:%b %Y}',
+                       f'{eurusd.index[0]:%b %Y} to {eurusd.index[-1]:%b %Y}', sample,
+                       f'{hicp.index[0]:%b %Y} to {hicp.index[-1]:%b %Y}'],
+            'Observations': [len(rets), len(rets), len(cpi), len(eurusd), len(rf_eur), len(hicp)]}
+        ).set_index('Series'), alt='Data sources')
+        st.caption('Returns cover the months of the sample; the price indices start twelve months earlier, so that '
+                   'inflation over the previous twelve months is defined from the first month, and the exchange rate '
+                   'at the month-end before the first return. Interest rates are the previous month\'s averages. Live '
+                   'data are downloaded once per server session. If a source does not respond, the app uses the data '
+                   'saved by the notebook\'s own run, and says so at the top of the page.')
         show_data(rets_p, 'Show the monthly returns', file_name='monthly_returns.csv')
         show_data(pd.DataFrame({'CPI': cpi, 'Monthly inflation': cpi.pct_change(fill_method=None),
                                 '12-month inflation': cpi.pct_change(12, fill_method=None)}),
                   'Show the consumer price index', file_name='consumer_prices.csv')
+        show_data(pd.DataFrame({'Dollars per euro': eurusd, 'Dollar return in euros': dollar_return,
+                                'Euribor return': rf_eur, 'HICP': hicp,
+                                'Monthly euro-area inflation': hicp.pct_change(fill_method=None)}),
+                  'Show the exchange rate, Euribor and the HICP', file_name='euro_data.csv')
         show_data(results, 'Show the simulation results', file_name='simulation_results.csv')
 
         if 'OWNER/REPO' not in REPO_URL:
@@ -1092,12 +1400,13 @@ def section_method():
 
 if view == 'Client':
     sections = {'Overview': section_overview, 'Crises': section_crises, 'Four seasons': section_regimes,
-                'Inflation': section_inflation, 'Method and data': section_method}
+                'Inflation': section_inflation, 'Currency': section_currency, 'Method and data': section_method}
 else:
     sections = {'Overview': section_overview, 'Performance': section_performance, 'Risk': section_risk,
-                'Rebalancing and costs': section_rebalancing, 'Crises': section_crises,
-                'Rebalancing rules': section_rules, 'Calendar years': section_calendar,
-                'Four seasons': section_regimes, 'Inflation': section_inflation, 'Method and data': section_method}
+                'Rebalancing': section_rebalancing, 'Crises': section_crises,
+                'Rules': section_rules, 'Calendar years': section_calendar,
+                'Four seasons': section_regimes, 'Inflation': section_inflation, 'Currency': section_currency,
+                'Method and data': section_method}
 tabs = st.tabs(list(sections), key=f'tab_{view.lower()}', bind='query-params')
 for tab, render in zip(tabs, sections.values()):
     with tab:
