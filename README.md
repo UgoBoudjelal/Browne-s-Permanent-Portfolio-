@@ -4,7 +4,7 @@ Group G · 2270 Financial Modeling · Nova SBE
 
 [![tests](https://github.com/UgoBoudjelal/Browne-s-Permanent-Portfolio-/actions/workflows/tests.yml/badge.svg)](https://github.com/UgoBoudjelal/Browne-s-Permanent-Portfolio-/actions/workflows/tests.yml)
 
-**Application:** *(link added after deployment)*
+**Application:** [brownes-permanent-portfolio-novasbe.streamlit.app](https://brownes-permanent-portfolio-novasbe.streamlit.app)
 **Notebook:** [`notebook/Group_G_Permanent_Portfolio.ipynb`](notebook/Group_G_Permanent_Portfolio.ipynb) ·
 [Open in Colab](https://colab.research.google.com/github/UgoBoudjelal/Browne-s-Permanent-Portfolio-/blob/main/notebook/Group_G_Permanent_Portfolio.ipynb)
 
